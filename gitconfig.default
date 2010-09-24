@@ -1,0 +1,14 @@
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+[remote "upstream"]
+	url = git://git.apache.org/couchdb.git/
+	fetch = +refs/heads/*:refs/remotes/upstream/*
+[remote "origin"]
+	url = futurado:/var/git/couchdb.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "fork"]
+	remote = origin
+	merge = refs/heads/fork
