@@ -14,6 +14,13 @@
 
 
 function loadScript(url) {
+  // disallow loading remote URLs
+  if((url.substr(0, 7) == "http://")
+    || (url.substr(0, 2) == "//")
+    || (url.substr(0, 5) == "data:")
+    || (url.substr(0, 11) == "javascript:")) {
+        throw "Not loading remote test scripts";
+  }
   if (typeof document != "undefined") document.write('<script src="'+url+'"></script>');
 };
 
@@ -407,9 +414,22 @@ function waitForSuccess(fun, tag) {
 
 function waitForRestart() {
   var waiting = true;
-  while (waiting) {
+  // Wait for the server to go down but don't
+  // wait too long because we might miss the
+  // the unavailable period.
+  var count = 25;
+  while (waiting && count > 0) {
+    count--;
     try {
       CouchDB.request("GET", "/");
+    } catch(e) {
+      waiting = false;
+    }
+  }
+  // Wait for it to come back up
+  waiting = true;
+  while (waiting) {
+    try {
       CouchDB.request("GET", "/");
       waiting = false;
     } catch(e) {

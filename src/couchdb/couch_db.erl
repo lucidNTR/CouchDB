@@ -13,20 +13,22 @@
 -module(couch_db).
 -behaviour(gen_server).
 
--export([open/2,open_int/2,close/1,create/2,start_compact/1,get_db_info/1,get_design_docs/1]).
+-export([open/2,open_int/2,close/1,create/2,get_db_info/1,get_design_docs/1]).
+-export([start_compact/1, cancel_compact/1]).
 -export([open_ref_counted/2,is_idle/1,monitor/1,count_changes_since/2]).
 -export([update_doc/3,update_doc/4,update_docs/4,update_docs/2,update_docs/3,delete_doc/3]).
 -export([get_doc_info/2,open_doc/2,open_doc/3,open_doc_revs/4]).
 -export([set_revs_limit/2,get_revs_limit/1]).
--export([get_missing_revs/2,name/1,doc_to_tree/1,get_update_seq/1,get_committed_update_seq/1]).
+-export([get_missing_revs/2,name/1,get_update_seq/1,get_committed_update_seq/1]).
 -export([enum_docs/4,enum_docs_since/5]).
 -export([enum_docs_since_reduce_to_count/1,enum_docs_reduce_to_count/1]).
 -export([increment_update_seq/1,get_purge_seq/1,purge_docs/2,get_last_purged/1]).
 -export([start_link/3,open_doc_int/3,ensure_full_commit/1]).
 -export([set_security/2,get_security/1]).
 -export([init/1,terminate/2,handle_call/3,handle_cast/2,code_change/3,handle_info/2]).
--export([changes_since/5,changes_since/6,read_doc/2,new_revid/1]).
--export([check_is_admin/1, check_is_reader/1]).
+-export([changes_since/4,changes_since/5,read_doc/2,new_revid/1]).
+-export([check_is_admin/1, check_is_member/1]).
+-export([reopen/1]).
 
 -include("couch_db.hrl").
 
@@ -76,7 +78,7 @@ open(DbName, Options) ->
     case couch_server:open(DbName, Options) of
         {ok, Db} ->
             try
-                check_is_reader(Db),
+                check_is_member(Db),
                 {ok, Db}
             catch
                 throw:Error ->
@@ -85,6 +87,18 @@ open(DbName, Options) ->
             end;
         Else -> Else
     end.
+
+reopen(#db{main_pid = Pid, fd_ref_counter = OldRefCntr, user_ctx = UserCtx}) ->
+    {ok, #db{fd_ref_counter = NewRefCntr} = NewDb} =
+        gen_server:call(Pid, get_db, infinity),
+    case NewRefCntr =:= OldRefCntr of
+    true ->
+        ok;
+    false ->
+        couch_ref_counter:add(NewRefCntr),
+        catch couch_ref_counter:drop(OldRefCntr)
+    end,
+    {ok, NewDb#db{user_ctx = UserCtx}}.
 
 ensure_full_commit(#db{update_pid=UpdatePid,instance_start_time=StartTime}) ->
     ok = gen_server:call(UpdatePid, full_commit, infinity),
@@ -96,6 +110,8 @@ close(#db{fd_ref_counter=RefCntr}) ->
 open_ref_counted(MainPid, OpenedPid) ->
     gen_server:call(MainPid, {open_ref_count, OpenedPid}).
 
+is_idle(#db{main_pid = MainPid}) ->
+    is_idle(MainPid);
 is_idle(MainPid) ->
     gen_server:call(MainPid, is_idle).
 
@@ -104,6 +120,9 @@ monitor(#db{main_pid=MainPid}) ->
 
 start_compact(#db{update_pid=Pid}) ->
     gen_server:call(Pid, start_compact).
+
+cancel_compact(#db{update_pid=Pid}) ->
+    gen_server:call(Pid, cancel_compact).
 
 delete_doc(Db, Id, Revisions) ->
     DeletedDocs = [#doc{id=Id, revs=[Rev], deleted=true} || Rev <- Revisions],
@@ -140,6 +159,8 @@ apply_open_options2(#doc{atts=Atts,revs=Revs}=Doc,
     apply_open_options2(Doc#doc{atts=[A#att{data=
         if AttPos>RevPos -> Data; true -> stub end}
         || #att{revpos=AttPos,data=Data}=A <- Atts]}, Rest);
+apply_open_options2(Doc, [ejson_body | Rest]) ->
+    apply_open_options2(couch_doc:with_ejson_body(Doc), Rest);
 apply_open_options2(Doc,[_|Rest]) ->
     apply_open_options2(Doc,Rest).
 
@@ -210,7 +231,7 @@ get_full_doc_info(Db, Id) ->
     Result.
 
 get_full_doc_infos(Db, Ids) ->
-    couch_btree:lookup(Db#db.fulldocinfo_by_id_btree, Ids).
+    couch_btree:lookup(by_id_btree(Db), Ids).
 
 increment_update_seq(#db{update_pid=UpdatePid}) ->
     gen_server:call(UpdatePid, increment_update_seq).
@@ -238,34 +259,59 @@ get_db_info(Db) ->
         compactor_pid=Compactor,
         update_seq=SeqNum,
         name=Name,
-        fulldocinfo_by_id_btree=FullDocBtree,
         instance_start_time=StartTime,
-        committed_update_seq=CommittedUpdateSeq} = Db,
+        committed_update_seq=CommittedUpdateSeq,
+        fulldocinfo_by_id_btree = IdBtree,
+        docinfo_by_seq_btree = SeqBtree,
+        local_docs_btree = LocalBtree
+    } = Db,
     {ok, Size} = couch_file:bytes(Fd),
-    {ok, {Count, DelCount}} = couch_btree:full_reduce(FullDocBtree),
+    {ok, DbReduction} = couch_btree:full_reduce(by_id_btree(Db)),
     InfoList = [
         {db_name, Name},
-        {doc_count, Count},
-        {doc_del_count, DelCount},
+        {doc_count, element(1, DbReduction)},
+        {doc_del_count, element(2, DbReduction)},
         {update_seq, SeqNum},
         {purge_seq, couch_db:get_purge_seq(Db)},
         {compact_running, Compactor/=nil},
         {disk_size, Size},
+        {data_size, db_data_size(DbReduction, [SeqBtree, IdBtree, LocalBtree])},
         {instance_start_time, StartTime},
         {disk_format_version, DiskVersion},
         {committed_update_seq, CommittedUpdateSeq}
         ],
     {ok, InfoList}.
 
-get_design_docs(#db{fulldocinfo_by_id_btree=Btree}=Db) ->
-    {ok,_, Docs} = couch_btree:fold(Btree,
-        fun(#full_doc_info{id= <<"_design/",_/binary>>}=FullDocInfo, _Reds, AccDocs) ->
-            {ok, Doc} = couch_db:open_doc_int(Db, FullDocInfo, []),
-            {ok, [Doc | AccDocs]};
-        (_, _Reds, AccDocs) ->
-            {stop, AccDocs}
-        end,
-        [], [{start_key, <<"_design/">>}, {end_key_gt, <<"_design0">>}]),
+db_data_size({_Count, _DelCount}, _Trees) ->
+    % pre 1.2 format, upgraded on compaction
+    null;
+db_data_size({_Count, _DelCount, nil}, _Trees) ->
+    null;
+db_data_size({_Count, _DelCount, DocAndAttsSize}, Trees) ->
+    sum_tree_sizes(DocAndAttsSize, Trees).
+
+sum_tree_sizes(Acc, []) ->
+    Acc;
+sum_tree_sizes(Acc, [T | Rest]) ->
+    case couch_btree:size(T) of
+    nil ->
+        null;
+    Sz ->
+        sum_tree_sizes(Acc + Sz, Rest)
+    end.
+
+get_design_docs(Db) ->
+    FoldFun = skip_deleted(fun
+        (#full_doc_info{deleted = true}, _Reds, Acc) ->
+            {ok, Acc};
+        (#full_doc_info{id= <<"_design/",_/binary>>}=FullDocInfo, _Reds, Acc) ->
+            {ok, Doc} = open_doc_int(Db, FullDocInfo, [ejson_body]),
+            {ok, [Doc | Acc]};
+        (_, _Reds, Acc) ->
+            {stop, Acc}
+    end),
+    KeyOpts = [{start_key, <<"_design/">>}, {end_key_gt, <<"_design0">>}],
+    {ok, _, Docs} = couch_btree:fold(by_id_btree(Db), FoldFun, [], KeyOpts),
     {ok, Docs}.
 
 check_is_admin(#db{user_ctx=#user_ctx{name=Name,roles=Roles}}=Db) ->
@@ -284,14 +330,14 @@ check_is_admin(#db{user_ctx=#user_ctx{name=Name,roles=Roles}}=Db) ->
         ok
     end.
 
-check_is_reader(#db{user_ctx=#user_ctx{name=Name,roles=Roles}=UserCtx}=Db) ->
+check_is_member(#db{user_ctx=#user_ctx{name=Name,roles=Roles}=UserCtx}=Db) ->
     case (catch check_is_admin(Db)) of
     ok -> ok;
     _ ->
-        {Readers} = get_readers(Db),
-        ReaderRoles = couch_util:get_value(<<"roles">>, Readers,[]),
+        {Members} = get_members(Db),
+        ReaderRoles = couch_util:get_value(<<"roles">>, Members,[]),
         WithAdminRoles = [<<"_admin">> | ReaderRoles],
-        ReaderNames = couch_util:get_value(<<"names">>, Readers,[]),
+        ReaderNames = couch_util:get_value(<<"names">>, Members,[]),
         case ReaderRoles ++ ReaderNames of
         [] -> ok; % no readers == public access
         _Else ->
@@ -313,8 +359,10 @@ check_is_reader(#db{user_ctx=#user_ctx{name=Name,roles=Roles}=UserCtx}=Db) ->
 get_admins(#db{security=SecProps}) ->
     couch_util:get_value(<<"admins">>, SecProps, {[]}).
 
-get_readers(#db{security=SecProps}) ->
-    couch_util:get_value(<<"readers">>, SecProps, {[]}).
+get_members(#db{security=SecProps}) ->
+    % we fallback to readers here for backwards compatibility
+    couch_util:get_value(<<"members">>, SecProps,
+        couch_util:get_value(<<"readers">>, SecProps, {[]})).
 
 get_security(#db{security=SecProps}) ->
     {SecProps}.
@@ -330,9 +378,11 @@ set_security(_, _) ->
 
 validate_security_object(SecProps) ->
     Admins = couch_util:get_value(<<"admins">>, SecProps, {[]}),
-    Readers = couch_util:get_value(<<"readers">>, SecProps, {[]}),
+    % we fallback to readers here for backwards compatibility
+    Members = couch_util:get_value(<<"members">>, SecProps,
+        couch_util:get_value(<<"readers">>, SecProps, {[]})),
     ok = validate_names_and_roles(Admins),
-    ok = validate_names_and_roles(Readers),
+    ok = validate_names_and_roles(Members),
     ok.
 
 % validate user input
@@ -494,8 +544,14 @@ prep_and_validate_updates(Db, [DocBucket|RestBuckets],
         [{ok, #full_doc_info{rev_tree=OldRevTree}=OldFullDocInfo}|RestLookups],
         AllowConflict, AccPrepped, AccErrors) ->
     Leafs = couch_key_tree:get_all_leafs(OldRevTree),
-    LeafRevsDict = dict:from_list([{{Start, RevId}, {Deleted, Sp, Revs}} ||
-            {{Deleted, Sp, _Seq}, {Start, [RevId|_]}=Revs} <- Leafs]),
+    LeafRevsDict = dict:from_list([
+        begin
+            Deleted = element(1, LeafVal),
+            Sp = element(2, LeafVal),
+            {{Start, RevId}, {Deleted, Sp, Revs}}
+        end ||
+        {LeafVal, {Start, [RevId | _]} = Revs} <- Leafs
+    ]),
     {PreppedBucket, AccErrors3} = lists:foldl(
         fun(Doc, {Docs2Acc, AccErrors2}) ->
             case prep_and_validate_update(Db, Doc, OldFullDocInfo,
@@ -542,7 +598,8 @@ prep_and_validate_replicated_updates(Db, [Bucket|RestBuckets], [OldInfo|RestOldI
     {ok, #full_doc_info{rev_tree=OldTree}} ->
         NewRevTree = lists:foldl(
             fun(NewDoc, AccTree) ->
-                {NewTree, _} = couch_key_tree:merge(AccTree, [couch_db:doc_to_tree(NewDoc)]),
+                {NewTree, _} = couch_key_tree:merge(AccTree,
+                    couch_doc:to_path(NewDoc), Db#db.revs_limit),
                 NewTree
             end,
             OldTree, Bucket),
@@ -645,7 +702,7 @@ update_docs(Db, Docs, Options, replicated_changes) ->
         DocErrors = [],
         DocBuckets3 = DocBuckets
     end,
-    DocBuckets4 = [[doc_flush_atts(check_dup_atts(Doc), Db#db.fd)
+    DocBuckets4 = [[doc_flush_atts(check_dup_atts(Doc), Db#db.updater_fd)
             || Doc <- Bucket] || Bucket <- DocBuckets3],
     {ok, []} = write_and_commit(Db, DocBuckets4, [], [merge_conflicts | Options]),
     {ok, DocErrors};
@@ -701,7 +758,7 @@ update_docs(Db, Docs, Options, interactive_edit) ->
                 true -> [] end ++ Options,
         DocBuckets3 = [[
                 doc_flush_atts(set_new_att_revpos(
-                        check_dup_atts(Doc)), Db#db.fd)
+                        check_dup_atts(Doc)), Db#db.updater_fd)
                 || Doc <- B] || B <- DocBuckets2],
         {DocBuckets4, IdRevs} = new_revs(DocBuckets3, [], []),
         
@@ -719,9 +776,13 @@ update_docs(Db, Docs, Options, interactive_edit) ->
 % for the doc.
 make_first_doc_on_disk(_Db, _Id, _Pos, []) ->
     nil;
+make_first_doc_on_disk(Db, Id, Pos, [{_Rev, #doc{}} | RestPath]) ->
+    make_first_doc_on_disk(Db, Id, Pos-1, RestPath);
 make_first_doc_on_disk(Db, Id, Pos, [{_Rev, ?REV_MISSING}|RestPath]) ->
     make_first_doc_on_disk(Db, Id, Pos - 1, RestPath);
-make_first_doc_on_disk(Db, Id, Pos, [{_Rev, {IsDel, Sp, _Seq}} |_]=DocPath) ->
+make_first_doc_on_disk(Db, Id, Pos, [{_Rev, RevValue} |_]=DocPath) ->
+    IsDel = element(1, RevValue),
+    Sp = element(2, RevValue),
     Revs = [Rev || {Rev, _} <- DocPath],
     make_doc(Db, Id, IsDel, Sp, {Pos, Revs}).
 
@@ -755,8 +816,9 @@ collect_results(UpdatePid, MRef, ResultsAcc) ->
         exit(Reason)
     end.
 
-write_and_commit(#db{update_pid=UpdatePid, user_ctx=Ctx}=Db, DocBuckets,
+write_and_commit(#db{update_pid=UpdatePid}=Db, DocBuckets1,
         NonRepDocs, Options0) ->
+    DocBuckets = prepare_doc_summaries(Db, DocBuckets1),
     Options = set_commit_option(Options0),
     MergeConflicts = lists:member(merge_conflicts, Options),
     FullCommit = lists:member(full_commit, Options),
@@ -768,11 +830,15 @@ write_and_commit(#db{update_pid=UpdatePid, user_ctx=Ctx}=Db, DocBuckets,
         retry ->
             % This can happen if the db file we wrote to was swapped out by
             % compaction. Retry by reopening the db and writing to the current file
-            {ok, Db2} = open_ref_counted(Db#db.main_pid, Ctx),
-            DocBuckets2 = [[doc_flush_atts(Doc, Db2#db.fd) || Doc <- Bucket] || Bucket <- DocBuckets],
+            {ok, Db2} = open_ref_counted(Db#db.main_pid, self()),
+            DocBuckets2 = [
+                [doc_flush_atts(Doc, Db2#db.updater_fd) || Doc <- Bucket] ||
+                Bucket <- DocBuckets1
+            ],
             % We only retry once
+            DocBuckets3 = prepare_doc_summaries(Db2, DocBuckets2),
             close(Db2),
-            UpdatePid ! {update_docs, self(), DocBuckets2, NonRepDocs, MergeConflicts, FullCommit},
+            UpdatePid ! {update_docs, self(), DocBuckets3, NonRepDocs, MergeConflicts, FullCommit},
             case collect_results(UpdatePid, MRef, []) of
             {ok, Results} -> {ok, Results};
             retry -> throw({update_error, compaction_retry})
@@ -781,6 +847,24 @@ write_and_commit(#db{update_pid=UpdatePid, user_ctx=Ctx}=Db, DocBuckets,
     after
         erlang:demonitor(MRef, [flush])
     end.
+
+
+prepare_doc_summaries(Db, BucketList) ->
+    [lists:map(
+        fun(#doc{body = Body, atts = Atts} = Doc) ->
+            DiskAtts = [{N, T, P, AL, DL, R, M, E} ||
+                #att{name = N, type = T, data = {_, P}, md5 = M, revpos = R,
+                    att_len = AL, disk_len = DL, encoding = E} <- Atts],
+            AttsFd = case Atts of
+            [#att{data = {Fd, _}} | _] ->
+                Fd;
+            [] ->
+                nil
+            end,
+            SummaryChunk = couch_db_updater:make_doc_summary(Db, {Body, DiskAtts}),
+            Doc#doc{body = {summary, SummaryChunk, AttsFd}}
+        end,
+        Bucket) || Bucket <- BucketList].
 
 
 set_new_att_revpos(#doc{revs={RevPos,_Revs},atts=Atts}=Doc) ->
@@ -796,18 +880,19 @@ doc_flush_atts(Doc, Fd) ->
     Doc#doc{atts=[flush_att(Fd, Att) || Att <- Doc#doc.atts]}.
 
 check_md5(_NewSig, <<>>) -> ok;
-check_md5(Sig1, Sig2) when Sig1 == Sig2 -> ok;
+check_md5(Sig, Sig) -> ok;
 check_md5(_, _) -> throw(md5_mismatch).
 
 flush_att(Fd, #att{data={Fd0, _}}=Att) when Fd0 == Fd ->
     % already written to our file, nothing to write
     Att;
 
-flush_att(Fd, #att{data={OtherFd,StreamPointer}, md5=InMd5}=Att) ->
+flush_att(Fd, #att{data={OtherFd,StreamPointer}, md5=InMd5,
+    disk_len=InDiskLen} = Att) ->
     {NewStreamData, Len, _IdentityLen, Md5, IdentityMd5} =
             couch_stream:copy_to_new_stream(OtherFd, StreamPointer, Fd),
     check_md5(IdentityMd5, InMd5),
-    Att#att{data={Fd, NewStreamData}, md5=Md5, att_len=Len, disk_len=Len};
+    Att#att{data={Fd, NewStreamData}, md5=Md5, att_len=Len, disk_len=InDiskLen};
 
 flush_att(Fd, #att{data=Data}=Att) when is_binary(Data) ->
     with_stream(Fd, Att, fun(OutputStream) ->
@@ -841,6 +926,24 @@ flush_att(Fd, #att{data=Fun,att_len=AttLen}=Att) when is_function(Fun) ->
         write_streamed_attachment(OutputStream, Fun, AttLen)
     end).
 
+
+compressible_att_type(MimeType) when is_binary(MimeType) ->
+    compressible_att_type(?b2l(MimeType));
+compressible_att_type(MimeType) ->
+    TypeExpList = re:split(
+        couch_config:get("attachments", "compressible_types", ""),
+        "\\s*,\\s*",
+        [{return, list}]
+    ),
+    lists:any(
+        fun(TypeExp) ->
+            Regexp = ["^\\s*", re:replace(TypeExp, "\\*", ".*"),
+                "(?:\\s*;.*?)?\\s*", $$],
+            re:run(MimeType, Regexp, [caseless]) =/= nomatch
+        end,
+        [T || T <- TypeExpList, T /= []]
+    ).
+
 % From RFC 2616 3.6.1 - Chunked Transfer Coding
 %
 %   In other words, the origin server is willing to accept
@@ -853,7 +956,7 @@ flush_att(Fd, #att{data=Fun,att_len=AttLen}=Att) when is_function(Fun) ->
 % pretend that no Content-MD5 exists.
 with_stream(Fd, #att{md5=InMd5,type=Type,encoding=Enc}=Att, Fun) ->
     {ok, OutputStream} = case (Enc =:= identity) andalso
-        couch_util:compressible_att_type(Type) of
+        compressible_att_type(Type) of
     true ->
         CompLevel = list_to_integer(
             couch_config:get("attachments", "compression_level", "0")
@@ -905,56 +1008,53 @@ with_stream(Fd, #att{md5=InMd5,type=Type,encoding=Enc}=Att, Fun) ->
 
 write_streamed_attachment(_Stream, _F, 0) ->
     ok;
-write_streamed_attachment(Stream, F, LenLeft) ->
-    Bin = F(),
+write_streamed_attachment(Stream, F, LenLeft) when LenLeft > 0 ->
+    Bin = read_next_chunk(F, LenLeft),
     ok = couch_stream:write(Stream, Bin),
     write_streamed_attachment(Stream, F, LenLeft - size(Bin)).
+
+read_next_chunk(F, _) when is_function(F, 0) ->
+    F();
+read_next_chunk(F, LenLeft) when is_function(F, 1) ->
+    F(lists:min([LenLeft, 16#2000])).
 
 enum_docs_since_reduce_to_count(Reds) ->
     couch_btree:final_reduce(
             fun couch_db_updater:btree_by_seq_reduce/2, Reds).
 
 enum_docs_reduce_to_count(Reds) ->
-    {Count, _DelCount} = couch_btree:final_reduce(
+    FinalRed = couch_btree:final_reduce(
             fun couch_db_updater:btree_by_id_reduce/2, Reds),
-    Count.
+    element(1, FinalRed).
 
-changes_since(Db, Style, StartSeq, Fun, Acc) ->
-    changes_since(Db, Style, StartSeq, Fun, [], Acc).
+changes_since(Db, StartSeq, Fun, Acc) ->
+    changes_since(Db, StartSeq, Fun, [], Acc).
     
-changes_since(Db, Style, StartSeq, Fun, Options, Acc) ->
-    Wrapper = fun(DocInfo, _Offset, Acc2) ->
-            #doc_info{revs=Revs} = DocInfo,
-            DocInfo2 =
-            case Style of
-            main_only ->
-                DocInfo;
-            all_docs ->
-                % remove revs before the seq
-                DocInfo#doc_info{revs=[RevInfo ||
-                    #rev_info{seq=RevSeq}=RevInfo <- Revs, StartSeq < RevSeq]}
-            end,
-            Fun(DocInfo2, Acc2)
-        end,
-    {ok, _LastReduction, AccOut} = couch_btree:fold(Db#db.docinfo_by_seq_btree,
+changes_since(Db, StartSeq, Fun, Options, Acc) ->
+    Wrapper = fun(DocInfo, _Offset, Acc2) -> Fun(DocInfo, Acc2) end,
+    {ok, _LastReduction, AccOut} = couch_btree:fold(by_seq_btree(Db),
         Wrapper, Acc, [{start_key, StartSeq + 1}] ++ Options),
     {ok, AccOut}.
 
 count_changes_since(Db, SinceSeq) ->
+    BTree = by_seq_btree(Db),
     {ok, Changes} =
-    couch_btree:fold_reduce(Db#db.docinfo_by_seq_btree,
+    couch_btree:fold_reduce(BTree,
         fun(_SeqStart, PartialReds, 0) ->
-            {ok, couch_btree:final_reduce(Db#db.docinfo_by_seq_btree, PartialReds)}
+            {ok, couch_btree:final_reduce(BTree, PartialReds)}
         end,
         0, [{start_key, SinceSeq + 1}]),
     Changes.
 
 enum_docs_since(Db, SinceSeq, InFun, Acc, Options) ->
-    {ok, LastReduction, AccOut} = couch_btree:fold(Db#db.docinfo_by_seq_btree, InFun, Acc, [{start_key, SinceSeq + 1} | Options]),
+    {ok, LastReduction, AccOut} = couch_btree:fold(
+        by_seq_btree(Db), InFun, Acc, [{start_key, SinceSeq + 1} | Options]),
     {ok, enum_docs_since_reduce_to_count(LastReduction), AccOut}.
 
 enum_docs(Db, InFun, InAcc, Options) ->
-    {ok, LastReduce, OutAcc} = couch_btree:fold(Db#db.fulldocinfo_by_id_btree, InFun, InAcc, Options),
+    FoldFun = skip_deleted(InFun),
+    {ok, LastReduce, OutAcc} = couch_btree:fold(
+        by_id_btree(Db), FoldFun, InAcc, Options),
     {ok, enum_docs_reduce_to_count(LastReduce), OutAcc}.
 
 % server functions
@@ -1039,7 +1139,9 @@ open_doc_revs_int(Db, IdRevs, Options) ->
                     ?REV_MISSING ->
                         % we have the rev in our list but know nothing about it
                         {{not_found, missing}, {Pos, Rev}};
-                    {IsDeleted, SummaryPtr, _UpdateSeq} ->
+                    RevValue ->
+                        IsDeleted = element(1, RevValue),
+                        SummaryPtr = element(2, RevValue),
                         {ok, make_doc(Db, Id, IsDeleted, SummaryPtr, FoundRevPath)}
                     end
                 end, FoundRevs),
@@ -1053,23 +1155,26 @@ open_doc_revs_int(Db, IdRevs, Options) ->
         end,
         IdRevs, LookupResults).
 
-open_doc_int(Db, <<?LOCAL_DOC_PREFIX, _/binary>> = Id, _Options) ->
-    case couch_btree:lookup(Db#db.local_docs_btree, [Id]) of
+open_doc_int(Db, <<?LOCAL_DOC_PREFIX, _/binary>> = Id, Options) ->
+    case couch_btree:lookup(local_btree(Db), [Id]) of
     [{ok, {_, {Rev, BodyData}}}] ->
-        {ok, #doc{id=Id, revs={0, [list_to_binary(integer_to_list(Rev))]}, body=BodyData}};
+        Doc = #doc{id=Id, revs={0, [?l2b(integer_to_list(Rev))]}, body=BodyData},
+        apply_open_options({ok, Doc}, Options);
     [not_found] ->
         {not_found, missing}
     end;
 open_doc_int(Db, #doc_info{id=Id,revs=[RevInfo|_]}=DocInfo, Options) ->
     #rev_info{deleted=IsDeleted,rev={Pos,RevId},body_sp=Bp} = RevInfo,
     Doc = make_doc(Db, Id, IsDeleted, Bp, {Pos,[RevId]}),
-    {ok, Doc#doc{meta=doc_meta_info(DocInfo, [], Options)}};
+    apply_open_options(
+       {ok, Doc#doc{meta=doc_meta_info(DocInfo, [], Options)}}, Options);
 open_doc_int(Db, #full_doc_info{id=Id,rev_tree=RevTree}=FullDocInfo, Options) ->
     #doc_info{revs=[#rev_info{deleted=IsDeleted,rev=Rev,body_sp=Bp}|_]} =
         DocInfo = couch_doc:to_doc_info(FullDocInfo),
     {[{_, RevPath}], []} = couch_key_tree:get(RevTree, [Rev]),
     Doc = make_doc(Db, Id, IsDeleted, Bp, RevPath),
-    {ok, Doc#doc{meta=doc_meta_info(DocInfo, RevTree, Options)}};
+    apply_open_options(
+        {ok, Doc#doc{meta=doc_meta_info(DocInfo, RevTree, Options)}}, Options);
 open_doc_int(Db, Id, Options) ->
     case get_full_doc_info(Db, Id) of
     {ok, FullDocInfo} ->
@@ -1086,12 +1191,15 @@ doc_meta_info(#doc_info{high_seq=Seq,revs=[#rev_info{rev=Rev}|RestInfo]}, RevTre
             couch_key_tree:get_full_key_paths(RevTree, [Rev]),
 
         [{revs_info, Pos, lists:map(
-            fun({Rev1, {true, _Sp, _UpdateSeq}}) ->
-                {Rev1, deleted};
-            ({Rev1, {false, _Sp, _UpdateSeq}}) ->
-                {Rev1, available};
-            ({Rev1, ?REV_MISSING}) ->
-                {Rev1, missing}
+            fun({Rev1, ?REV_MISSING}) ->
+                {Rev1, missing};
+            ({Rev1, RevValue}) ->
+                case element(1, RevValue) of
+                true ->
+                    {Rev1, deleted};
+                false ->
+                    {Rev1, available}
+                end
             end, RevPath)}]
     end ++
     case lists:member(conflicts, Options) of
@@ -1115,31 +1223,24 @@ doc_meta_info(#doc_info{high_seq=Seq,revs=[#rev_info{rev=Rev}|RestInfo]}, RevTre
     true -> [{local_seq, Seq}]
     end.
 
-read_doc(#db{fd=Fd}, OldStreamPointer) when is_tuple(OldStreamPointer) ->
-    % 09 UPGRADE CODE
-    couch_stream:old_read_term(Fd, OldStreamPointer);
 read_doc(#db{fd=Fd}, Pos) ->
     couch_file:pread_term(Fd, Pos).
 
 
-doc_to_tree(#doc{revs={Start, RevIds}}=Doc) ->
-    [Tree] = doc_to_tree_simple(Doc, lists:reverse(RevIds)),
-    {Start - length(RevIds) + 1, Tree}.
-
-
-doc_to_tree_simple(Doc, [RevId]) ->
-    [{RevId, Doc, []}];
-doc_to_tree_simple(Doc, [RevId | Rest]) ->
-    [{RevId, ?REV_MISSING, doc_to_tree_simple(Doc, Rest)}].
-
-
-make_doc(#db{fd=Fd}=Db, Id, Deleted, Bp, RevisionPath) ->
+make_doc(#db{updater_fd = Fd} = Db, Id, Deleted, Bp, RevisionPath) ->
     {BodyData, Atts} =
     case Bp of
     nil ->
         {[], []};
     _ ->
-        {ok, {BodyData0, Atts0}} = read_doc(Db, Bp),
+        {ok, {BodyData0, Atts00}} = read_doc(Db, Bp),
+        Atts0 = case Atts00 of
+        _ when is_binary(Atts00) ->
+            couch_compress:decompress(Atts00);
+        _ when is_list(Atts00) ->
+            % pre 1.2 format
+            Atts00
+        end,
         {BodyData0,
             lists:map(
                 fun({Name,Type,Sp,AttLen,DiskLen,RevPos,Md5,Enc}) ->
@@ -1189,7 +1290,29 @@ make_doc(#db{fd=Fd}=Db, Id, Deleted, Bp, RevisionPath) ->
         }.
 
 
-increment_stat(#db{is_sys_db = true}, _Stat) ->
-    ok;
-increment_stat(#db{}, Stat) ->
-    couch_stats_collector:increment(Stat).
+increment_stat(#db{options = Options}, Stat) ->
+    case lists:member(sys_db, Options) of
+    true ->
+        ok;
+    false ->
+        couch_stats_collector:increment(Stat)
+    end.
+
+local_btree(#db{local_docs_btree = BTree, fd = ReaderFd}) ->
+    BTree#btree{fd = ReaderFd}.
+
+by_seq_btree(#db{docinfo_by_seq_btree = BTree, fd = ReaderFd}) ->
+    BTree#btree{fd = ReaderFd}.
+
+by_id_btree(#db{fulldocinfo_by_id_btree = BTree, fd = ReaderFd}) ->
+    BTree#btree{fd = ReaderFd}.
+
+skip_deleted(FoldFun) ->
+    fun
+        (visit, KV, Reds, Acc) ->
+            FoldFun(KV, Reds, Acc);
+        (traverse, _LK, {Undeleted, _Del, _Size}, Acc) when Undeleted == 0 ->
+            {skip, Acc};
+        (traverse, _, _, Acc) ->
+            {ok, Acc}
+    end.

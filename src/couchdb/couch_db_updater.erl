@@ -14,6 +14,7 @@
 -behaviour(gen_server).
 
 -export([btree_by_id_reduce/2,btree_by_seq_reduce/2]).
+-export([make_doc_summary/2]).
 -export([init/1,terminate/2,handle_call/3,handle_cast/2,code_change/3,handle_info/2]).
 
 -include("couch_db.hrl").
@@ -30,7 +31,6 @@ init({MainPid, DbName, Filepath, Fd, Options}) ->
         RootDir = couch_config:get("couchdb", "database_dir", "."),
         couch_file:delete(RootDir, Filepath ++ ".compact");
     false ->
-        ok = couch_file:upgrade_old_header(Fd, <<$g, $m, $k, 0>>), % 09 UPGRADE CODE
         case couch_file:read_header(Fd) of
         {ok, Header} ->
             ok;
@@ -42,14 +42,15 @@ init({MainPid, DbName, Filepath, Fd, Options}) ->
             file:delete(Filepath ++ ".compact")
         end
     end,
-
-    Db = init_db(DbName, Filepath, Fd, Header),
+    ReaderFd = open_reader_fd(Filepath, Options),
+    Db = init_db(DbName, Filepath, Fd, ReaderFd, Header, Options),
     Db2 = refresh_validate_doc_funs(Db),
-    {ok, Db2#db{main_pid = MainPid, is_sys_db = lists:member(sys_db, Options)}}.
+    {ok, Db2#db{main_pid = MainPid}}.
 
 
 terminate(_Reason, Db) ->
-    couch_file:close(Db#db.fd),
+    ok = couch_file:close(Db#db.updater_fd),
+    ok = couch_file:close(Db#db.fd),
     couch_util:shutdown_sync(Db#db.compactor_pid),
     couch_util:shutdown_sync(Db#db.fd_ref_counter),
     ok.
@@ -66,8 +67,9 @@ handle_call(increment_update_seq, _From, Db) ->
     couch_db_update_notifier:notify({updated, Db#db.name}),
     {reply, {ok, Db2#db.update_seq}, Db2};
 
-handle_call({set_security, NewSec}, _From, Db) ->
-    {ok, Ptr} = couch_file:append_term(Db#db.fd, NewSec),
+handle_call({set_security, NewSec}, _From, #db{compression = Comp} = Db) ->
+    {ok, Ptr, _} = couch_file:append_term(
+        Db#db.updater_fd, NewSec, [{compression, Comp}]),
     Db2 = commit_data(Db#db{security=NewSec, security_ptr=Ptr,
             update_seq=Db#db.update_seq+1}),
     ok = gen_server:call(Db2#db.main_pid, {db_updated, Db2}),
@@ -84,11 +86,12 @@ handle_call({purge_docs, _IdRevs}, _From,
     {reply, {error, purge_during_compaction}, Db};
 handle_call({purge_docs, IdRevs}, _From, Db) ->
     #db{
-        fd=Fd,
+        updater_fd = Fd,
         fulldocinfo_by_id_btree = DocInfoByIdBTree,
         docinfo_by_seq_btree = DocInfoBySeqBTree,
         update_seq = LastSeq,
-        header = Header = #db_header{purge_seq=PurgeSeq}
+        header = Header = #db_header{purge_seq=PurgeSeq},
+        compression = Comp
         } = Db,
     DocLookups = couch_btree:lookup(DocInfoByIdBTree,
             [Id || {Id, _Revs} <- IdRevs]),
@@ -118,8 +121,11 @@ handle_call({purge_docs, IdRevs}, _From, Db) ->
 
     {DocInfoToUpdate, NewSeq} = lists:mapfoldl(
         fun(#full_doc_info{rev_tree=Tree}=FullInfo, SeqAcc) ->
-            Tree2 = couch_key_tree:map_leafs( fun(RevInfo) ->
-                    RevInfo#rev_info{seq=SeqAcc + 1}
+            Tree2 = couch_key_tree:map_leafs(
+                fun(_RevId, LeafVal) ->
+                    IsDeleted = element(1, LeafVal),
+                    BodyPointer = element(2, LeafVal),
+                    {IsDeleted, BodyPointer, SeqAcc + 1}
                 end, Tree),
             {couch_doc:to_doc_info(FullInfo#full_doc_info{rev_tree=Tree2}),
                 SeqAcc + 1}
@@ -132,7 +138,8 @@ handle_call({purge_docs, IdRevs}, _From, Db) ->
             DocInfoToUpdate, SeqsToRemove),
     {ok, DocInfoByIdBTree2} = couch_btree:add_remove(DocInfoByIdBTree,
             FullDocInfoToUpdate, IdsToRemove),
-    {ok, Pointer} = couch_file:append_term(Fd, IdRevsPurged),
+    {ok, Pointer, _} = couch_file:append_term(
+            Fd, IdRevsPurged, [{compression, Comp}]),
 
     Db2 = commit_data(
         Db#db{
@@ -151,19 +158,27 @@ handle_call(start_compact, _From, Db) ->
         Pid = spawn_link(fun() -> start_copy_compact(Db) end),
         Db2 = Db#db{compactor_pid=Pid},
         ok = gen_server:call(Db#db.main_pid, {db_updated, Db2}),
-        {reply, ok, Db2};
+        {reply, {ok, Pid}, Db2};
     _ ->
         % compact currently running, this is a no-op
-        {reply, ok, Db}
-    end.
+        {reply, {ok, Db#db.compactor_pid}, Db}
+    end;
+handle_call(cancel_compact, _From, #db{compactor_pid = nil} = Db) ->
+    {reply, ok, Db};
+handle_call(cancel_compact, _From, #db{compactor_pid = Pid} = Db) ->
+    unlink(Pid),
+    exit(Pid, kill),
+    RootDir = couch_config:get("couchdb", "database_dir", "."),
+    ok = couch_file:delete(RootDir, Db#db.filepath ++ ".compact"),
+    {reply, ok, Db#db{compactor_pid = nil}};
 
 
-
-handle_cast({compact_done, CompactFilepath}, #db{filepath=Filepath}=Db) ->
+handle_call({compact_done, CompactFilepath}, _From, #db{filepath=Filepath}=Db) ->
     {ok, NewFd} = couch_file:open(CompactFilepath),
+    ReaderFd = open_reader_fd(CompactFilepath, Db#db.options),
     {ok, NewHeader} = couch_file:read_header(NewFd),
     #db{update_seq=NewSeq} = NewDb =
-            init_db(Db#db.name, Filepath, NewFd, NewHeader),
+        init_db(Db#db.name, Filepath, NewFd, ReaderFd, NewHeader, Db#db.options),
     unlink(NewFd),
     case Db#db.update_seq == NewSeq of
     true ->
@@ -186,18 +201,23 @@ handle_cast({compact_done, CompactFilepath}, #db{filepath=Filepath}=Db) ->
         couch_file:delete(RootDir, Filepath),
         ok = file:rename(CompactFilepath, Filepath),
         close_db(Db),
-        ok = gen_server:call(Db#db.main_pid, {db_updated, NewDb2}),
+        NewDb3 = refresh_validate_doc_funs(NewDb2),
+        ok = gen_server:call(Db#db.main_pid, {db_updated, NewDb3}, infinity),
+        couch_db_update_notifier:notify({compacted, NewDb3#db.name}),
         ?LOG_INFO("Compaction for db \"~s\" completed.", [Db#db.name]),
-        {noreply, NewDb2#db{compactor_pid=nil}};
+        {reply, ok, NewDb3#db{compactor_pid=nil}};
     false ->
         ?LOG_INFO("Compaction file still behind main file "
             "(update seq=~p. compact update seq=~p). Retrying.",
             [Db#db.update_seq, NewSeq]),
         close_db(NewDb),
-        Pid = spawn_link(fun() -> start_copy_compact(Db) end),
-        Db2 = Db#db{compactor_pid=Pid},
-        {noreply, Db2}
+        {reply, {retry, Db}, Db}
     end.
+
+
+handle_cast(Msg, #db{name = Name} = Db) ->
+    ?LOG_ERROR("Database `~s` updater received unexpected cast: ~p", [Name, Msg]),
+    {stop, Msg, Db}.
 
 
 handle_info({update_docs, Client, GroupedDocs, NonRepDocs, MergeConflicts,
@@ -280,11 +300,14 @@ collect_updates(GroupedDocsAcc, ClientsAcc, MergeConflicts, FullCommit) ->
 
 
 btree_by_seq_split(#doc_info{id=Id, high_seq=KeySeq, revs=Revs}) ->
-    RevInfos = [{Rev, Seq, Bp} ||
-        #rev_info{rev=Rev,seq=Seq,deleted=false,body_sp=Bp} <- Revs],
-    DeletedRevInfos = [{Rev, Seq, Bp} ||
-        #rev_info{rev=Rev,seq=Seq,deleted=true,body_sp=Bp} <- Revs],
-    {KeySeq,{Id, RevInfos, DeletedRevInfos}}.
+    {RevInfos, DeletedRevInfos} = lists:foldl(
+        fun(#rev_info{deleted = false, seq = Seq} = Ri, {Acc, AccDel}) ->
+                {[{Ri#rev_info.rev, Seq, Ri#rev_info.body_sp} | Acc], AccDel};
+            (#rev_info{deleted = true, seq = Seq} = Ri, {Acc, AccDel}) ->
+                {Acc, [{Ri#rev_info.rev, Seq, Ri#rev_info.body_sp} | AccDel]}
+        end,
+        {[], []}, Revs),
+    {KeySeq, {Id, lists:reverse(RevInfos), lists:reverse(DeletedRevInfos)}}.
 
 btree_by_seq_join(KeySeq, {Id, RevInfos, DeletedRevInfos}) ->
     #doc_info{
@@ -294,56 +317,82 @@ btree_by_seq_join(KeySeq, {Id, RevInfos, DeletedRevInfos}) ->
             [#rev_info{rev=Rev,seq=Seq,deleted=false,body_sp = Bp} ||
                 {Rev, Seq, Bp} <- RevInfos] ++
             [#rev_info{rev=Rev,seq=Seq,deleted=true,body_sp = Bp} ||
-                {Rev, Seq, Bp} <- DeletedRevInfos]};
-btree_by_seq_join(KeySeq,{Id, Rev, Bp, Conflicts, DelConflicts, Deleted}) ->
-    % 09 UPGRADE CODE
-    % this is the 0.9.0 and earlier by_seq record. It's missing the body pointers
-    % and individual seq nums for conflicts that are currently in the index,
-    % meaning the filtered _changes api will not work except for on main docs.
-    % Simply compact a 0.9.0 database to upgrade the index.
-    #doc_info{
-        id=Id,
-        high_seq=KeySeq,
-        revs = [#rev_info{rev=Rev,seq=KeySeq,deleted=Deleted,body_sp=Bp}] ++
-            [#rev_info{rev=Rev1,seq=KeySeq,deleted=false} || Rev1 <- Conflicts] ++
-            [#rev_info{rev=Rev2,seq=KeySeq,deleted=true} || Rev2 <- DelConflicts]}.
+                {Rev, Seq, Bp} <- DeletedRevInfos]}.
 
 btree_by_id_split(#full_doc_info{id=Id, update_seq=Seq,
         deleted=Deleted, rev_tree=Tree}) ->
     DiskTree =
     couch_key_tree:map(
-        fun(_RevId, {IsDeleted, BodyPointer, UpdateSeq}) ->
-            {if IsDeleted -> 1; true -> 0 end, BodyPointer, UpdateSeq};
-        (_RevId, ?REV_MISSING) ->
-            ?REV_MISSING
+        fun(_RevId, ?REV_MISSING) ->
+            ?REV_MISSING;
+        (_RevId, RevValue) ->
+            IsDeleted = element(1, RevValue),
+            BodyPointer = element(2, RevValue),
+            UpdateSeq = element(3, RevValue),
+            Size = case tuple_size(RevValue) of
+            4 ->
+                element(4, RevValue);
+            3 ->
+                % pre 1.2 format, will be upgraded on compaction
+                nil
+            end,
+            {if IsDeleted -> 1; true -> 0 end, BodyPointer, UpdateSeq, Size}
         end, Tree),
     {Id, {Seq, if Deleted -> 1; true -> 0 end, DiskTree}}.
 
 btree_by_id_join(Id, {HighSeq, Deleted, DiskTree}) ->
-    Tree =
-    couch_key_tree:map(
-        fun(_RevId, {IsDeleted, BodyPointer, UpdateSeq}) ->
-            {IsDeleted == 1, BodyPointer, UpdateSeq};
-        (_RevId, ?REV_MISSING) ->
-            ?REV_MISSING;
-        (_RevId, {IsDeleted, BodyPointer}) ->
-            % 09 UPGRADE CODE
-            % this is the 0.9.0 and earlier rev info record. It's missing the seq
-            % nums, which means couchdb will sometimes reexamine unchanged
-            % documents with the _changes API.
-            % This is fixed by compacting the database.
-            {IsDeleted == 1, BodyPointer, HighSeq}
-        end, DiskTree),
-
-    #full_doc_info{id=Id, update_seq=HighSeq, deleted=Deleted==1, rev_tree=Tree}.
+    {Tree, LeafsSize} =
+    couch_key_tree:mapfold(
+        fun(_RevId, {IsDeleted, BodyPointer, UpdateSeq}, leaf, _Acc) ->
+            % pre 1.2 format, will be upgraded on compaction
+            {{IsDeleted == 1, BodyPointer, UpdateSeq, nil}, nil};
+        (_RevId, {IsDeleted, BodyPointer, UpdateSeq}, branch, Acc) ->
+            {{IsDeleted == 1, BodyPointer, UpdateSeq, nil}, Acc};
+        (_RevId, {IsDeleted, BodyPointer, UpdateSeq, Size}, leaf, Acc) ->
+            Acc2 = sum_leaf_sizes(Acc, Size),
+            {{IsDeleted == 1, BodyPointer, UpdateSeq, Size}, Acc2};
+        (_RevId, {IsDeleted, BodyPointer, UpdateSeq, Size}, branch, Acc) ->
+            {{IsDeleted == 1, BodyPointer, UpdateSeq, Size}, Acc};
+        (_RevId, ?REV_MISSING, _Type, Acc) ->
+            {?REV_MISSING, Acc}
+        end, 0, DiskTree),
+    #full_doc_info{
+        id = Id,
+        update_seq = HighSeq,
+        deleted = (Deleted == 1),
+        rev_tree = Tree,
+        leafs_size = LeafsSize
+    }.
 
 btree_by_id_reduce(reduce, FullDocInfos) ->
-    % count the number of not deleted documents
-    {length([1 || #full_doc_info{deleted=false} <- FullDocInfos]),
-        length([1 || #full_doc_info{deleted=true} <- FullDocInfos])};
+    lists:foldl(
+        fun(Info, {NotDeleted, Deleted, Size}) ->
+            Size2 = sum_leaf_sizes(Size, Info#full_doc_info.leafs_size),
+            case Info#full_doc_info.deleted of
+            true ->
+                {NotDeleted, Deleted + 1, Size2};
+            false ->
+                {NotDeleted + 1, Deleted, Size2}
+            end
+        end,
+        {0, 0, 0}, FullDocInfos);
 btree_by_id_reduce(rereduce, Reds) ->
-    {lists:sum([Count || {Count,_} <- Reds]),
-        lists:sum([DelCount || {_, DelCount} <- Reds])}.
+    lists:foldl(
+        fun({NotDeleted, Deleted}, {AccNotDeleted, AccDeleted, _AccSize}) ->
+            % pre 1.2 format, will be upgraded on compaction
+            {AccNotDeleted + NotDeleted, AccDeleted + Deleted, nil};
+        ({NotDeleted, Deleted, Size}, {AccNotDeleted, AccDeleted, AccSize}) ->
+            AccSize2 = sum_leaf_sizes(AccSize, Size),
+            {AccNotDeleted + NotDeleted, AccDeleted + Deleted, AccSize2}
+        end,
+        {0, 0, 0}, Reds).
+
+sum_leaf_sizes(nil, _) ->
+    nil;
+sum_leaf_sizes(_, nil) ->
+    nil;
+sum_leaf_sizes(Size1, Size2) ->
+    Size1 + Size2.
 
 btree_by_seq_reduce(reduce, DocInfos) ->
     % count the number of documents
@@ -351,23 +400,26 @@ btree_by_seq_reduce(reduce, DocInfos) ->
 btree_by_seq_reduce(rereduce, Reds) ->
     lists:sum(Reds).
 
-simple_upgrade_record(Old, New) when tuple_size(Old) =:= tuple_size(New) ->
-    Old;
 simple_upgrade_record(Old, New) when tuple_size(Old) < tuple_size(New) ->
     OldSz = tuple_size(Old),
     NewValuesTail =
         lists:sublist(tuple_to_list(New), OldSz + 1, tuple_size(New) - OldSz),
-    list_to_tuple(tuple_to_list(Old) ++ NewValuesTail).
+    list_to_tuple(tuple_to_list(Old) ++ NewValuesTail);
+simple_upgrade_record(Old, _New) ->
+    Old.
 
+-define(OLD_DISK_VERSION_ERROR,
+    "Database files from versions smaller than 0.10.0 are no longer supported").
 
-init_db(DbName, Filepath, Fd, Header0) ->
+init_db(DbName, Filepath, Fd, ReaderFd, Header0, Options) ->
     Header1 = simple_upgrade_record(Header0, #db_header{}),
     Header =
     case element(2, Header1) of
-    1 -> Header1#db_header{unused = 0, security_ptr = nil}; % 0.9
-    2 -> Header1#db_header{unused = 0, security_ptr = nil}; % post 0.9 and pre 0.10
-    3 -> Header1#db_header{security_ptr = nil}; % post 0.9 and pre 0.10
+    1 -> throw({database_disk_version_error, ?OLD_DISK_VERSION_ERROR});
+    2 -> throw({database_disk_version_error, ?OLD_DISK_VERSION_ERROR});
+    3 -> throw({database_disk_version_error, ?OLD_DISK_VERSION_ERROR});
     4 -> Header1#db_header{security_ptr = nil}; % 0.10 and pre 0.11
+    5 -> Header1; % pre 1.2
     ?LATEST_DISK_VERSION -> Header1;
     _ -> throw({database_disk_version_error, "Incorrect disk header version"})
     end,
@@ -381,15 +433,20 @@ init_db(DbName, Filepath, Fd, Header0) ->
     _ -> ok
     end,
 
+    Compression = couch_compress:get_compression_method(),
+
     {ok, IdBtree} = couch_btree:open(Header#db_header.fulldocinfo_by_id_btree_state, Fd,
         [{split, fun(X) -> btree_by_id_split(X) end},
         {join, fun(X,Y) -> btree_by_id_join(X,Y) end},
-        {reduce, fun(X,Y) -> btree_by_id_reduce(X,Y) end}]),
+        {reduce, fun(X,Y) -> btree_by_id_reduce(X,Y) end},
+        {compression, Compression}]),
     {ok, SeqBtree} = couch_btree:open(Header#db_header.docinfo_by_seq_btree_state, Fd,
             [{split, fun(X) -> btree_by_seq_split(X) end},
             {join, fun(X,Y) -> btree_by_seq_join(X,Y) end},
-            {reduce, fun(X,Y) -> btree_by_seq_reduce(X,Y) end}]),
-    {ok, LocalDocsBtree} = couch_btree:open(Header#db_header.local_docs_btree_state, Fd),
+            {reduce, fun(X,Y) -> btree_by_seq_reduce(X,Y) end},
+            {compression, Compression}]),
+    {ok, LocalDocsBtree} = couch_btree:open(Header#db_header.local_docs_btree_state, Fd,
+        [{compression, Compression}]),
     case Header#db_header.security_ptr of
     nil ->
         Security = [],
@@ -401,10 +458,11 @@ init_db(DbName, Filepath, Fd, Header0) ->
     {MegaSecs, Secs, MicroSecs} = now(),
     StartTime = ?l2b(io_lib:format("~p",
             [(MegaSecs*1000000*1000000) + (Secs*1000000) + MicroSecs])),
-    {ok, RefCntr} = couch_ref_counter:start([Fd]),
+    {ok, RefCntr} = couch_ref_counter:start([Fd, ReaderFd]),
     #db{
         update_pid=self(),
-        fd=Fd,
+        fd = ReaderFd,
+        updater_fd = Fd,
         fd_ref_counter = RefCntr,
         header=Header,
         fulldocinfo_by_id_btree = IdBtree,
@@ -418,9 +476,20 @@ init_db(DbName, Filepath, Fd, Header0) ->
         security_ptr = SecurityPtr,
         instance_start_time = StartTime,
         revs_limit = Header#db_header.revs_limit,
-        fsync_options = FsyncOptions
+        fsync_options = FsyncOptions,
+        options = Options,
+        compression = Compression
         }.
 
+open_reader_fd(Filepath, Options) ->
+    {ok, Fd} = case lists:member(sys_db, Options) of
+    true ->
+        couch_file:open(Filepath, [read_only, sys_db]);
+    false ->
+        couch_file:open(Filepath, [read_only])
+    end,
+    unlink(Fd),
+    Fd.
 
 close_db(#db{fd_ref_counter = RefCntr}) ->
     couch_ref_counter:drop(RefCntr).
@@ -441,62 +510,71 @@ refresh_validate_doc_funs(Db) ->
 
 flush_trees(_Db, [], AccFlushedTrees) ->
     {ok, lists:reverse(AccFlushedTrees)};
-flush_trees(#db{fd=Fd,header=Header}=Db,
+flush_trees(#db{updater_fd = Fd} = Db,
         [InfoUnflushed | RestUnflushed], AccFlushed) ->
     #full_doc_info{update_seq=UpdateSeq, rev_tree=Unflushed} = InfoUnflushed,
-    Flushed = couch_key_tree:map(
-        fun(_Rev, Value) ->
+    {Flushed, LeafsSize} = couch_key_tree:mapfold(
+        fun(_Rev, Value, Type, Acc) ->
             case Value of
-            #doc{atts=Atts,deleted=IsDeleted}=Doc ->
+            #doc{deleted = IsDeleted, body = {summary, Summary, AttsFd}} ->
                 % this node value is actually an unwritten document summary,
                 % write to disk.
                 % make sure the Fd in the written bins is the same Fd we are
                 % and convert bins, removing the FD.
                 % All bins should have been written to disk already.
-                DiskAtts =
-                case Atts of
-                [] -> [];
-                [#att{data={BinFd, _Sp}} | _ ] when BinFd == Fd ->
-                    [{N,T,P,AL,DL,R,M,E}
-                        || #att{name=N,type=T,data={_,P},md5=M,revpos=R,
-                               att_len=AL,disk_len=DL,encoding=E}
-                        <- Atts];
+                case {AttsFd, Fd} of
+                {nil, _} ->
+                    ok;
+                {SameFd, SameFd} ->
+                    ok;
                 _ ->
-                    % BinFd must not equal our Fd. This can happen when a database
-                    % is being switched out during a compaction
+                    % Fd where the attachments were written to is not the same
+                    % as our Fd. This can happen when a database is being
+                    % switched out during a compaction.
                     ?LOG_DEBUG("File where the attachments are written has"
                             " changed. Possibly retrying.", []),
                     throw(retry)
                 end,
-                {ok, NewSummaryPointer} =
-                case Header#db_header.disk_version < 4 of
-                true ->
-                    couch_file:append_term(Fd, {Doc#doc.body, DiskAtts});
-                false ->
-                    couch_file:append_term_md5(Fd, {Doc#doc.body, DiskAtts})
-                end,
-                {IsDeleted, NewSummaryPointer, UpdateSeq};
-            _ ->
-                Value
+                {ok, NewSummaryPointer, SummarySize} =
+                    couch_file:append_raw_chunk(Fd, Summary),
+                TotalSize = lists:foldl(
+                    fun(#att{att_len = L}, A) -> A + L end,
+                    SummarySize, Value#doc.atts),
+                NewValue = {IsDeleted, NewSummaryPointer, UpdateSeq, TotalSize},
+                case Type of
+                leaf ->
+                    {NewValue, Acc + TotalSize};
+                branch ->
+                    {NewValue, Acc}
+                end;
+             {_, _, _, LeafSize} when Type =:= leaf, LeafSize =/= nil ->
+                {Value, Acc + LeafSize};
+             _ ->
+                {Value, Acc}
             end
-        end, Unflushed),
-    flush_trees(Db, RestUnflushed, [InfoUnflushed#full_doc_info{rev_tree=Flushed} | AccFlushed]).
+        end, 0, Unflushed),
+    InfoFlushed = InfoUnflushed#full_doc_info{
+        rev_tree = Flushed,
+        leafs_size = LeafsSize
+    },
+    flush_trees(Db, RestUnflushed, [InfoFlushed | AccFlushed]).
 
 
 send_result(Client, Id, OriginalRevs, NewResult) ->
     % used to send a result to the client
     catch(Client ! {result, self(), {{Id, OriginalRevs}, NewResult}}).
 
-merge_rev_trees(_MergeConflicts, [], [], AccNewInfos, AccRemoveSeqs, AccSeq) ->
+merge_rev_trees(_Limit, _Merge, [], [], AccNewInfos, AccRemoveSeqs, AccSeq) ->
     {ok, lists:reverse(AccNewInfos), AccRemoveSeqs, AccSeq};
-merge_rev_trees(MergeConflicts, [NewDocs|RestDocsList],
+merge_rev_trees(Limit, MergeConflicts, [NewDocs|RestDocsList],
         [OldDocInfo|RestOldInfo], AccNewInfos, AccRemoveSeqs, AccSeq) ->
     #full_doc_info{id=Id,rev_tree=OldTree,deleted=OldDeleted,update_seq=OldSeq}
             = OldDocInfo,
     NewRevTree = lists:foldl(
         fun({Client, #doc{revs={Pos,[_Rev|PrevRevs]}}=NewDoc}, AccTree) ->
             if not MergeConflicts ->
-                case couch_key_tree:merge(AccTree, [couch_db:doc_to_tree(NewDoc)]) of
+                case couch_key_tree:merge(AccTree, couch_doc:to_path(NewDoc),
+                    Limit) of
                 {_NewTree, conflicts} when (not OldDeleted) ->
                     send_result(Client, Id, {Pos-1,PrevRevs}, conflict),
                     AccTree;
@@ -527,7 +605,7 @@ merge_rev_trees(MergeConflicts, [NewDocs|RestDocsList],
                                 NewDoc#doc{revs={OldPos, [OldRev]}}),
                         NewDoc2 = NewDoc#doc{revs={OldPos + 1, [NewRevId, OldRev]}},
                         {NewTree2, _} = couch_key_tree:merge(AccTree,
-                                [couch_db:doc_to_tree(NewDoc2)]),
+                                couch_doc:to_path(NewDoc2), Limit),
                         % we changed the rev id, this tells the caller we did
                         send_result(Client, Id, {Pos-1,PrevRevs},
                                 {ok, {OldPos + 1, NewRevId}}),
@@ -541,15 +619,15 @@ merge_rev_trees(MergeConflicts, [NewDocs|RestDocsList],
                 end;
             true ->
                 {NewTree, _} = couch_key_tree:merge(AccTree,
-                            [couch_db:doc_to_tree(NewDoc)]),
+                            couch_doc:to_path(NewDoc), Limit),
                 NewTree
             end
         end,
         OldTree, NewDocs),
     if NewRevTree == OldTree ->
         % nothing changed
-        merge_rev_trees(MergeConflicts, RestDocsList, RestOldInfo, AccNewInfos,
-                AccRemoveSeqs, AccSeq);
+        merge_rev_trees(Limit, MergeConflicts, RestDocsList, RestOldInfo,
+            AccNewInfos, AccRemoveSeqs, AccSeq);
     true ->
         % we have updated the document, give it a new seq #
         NewInfo = #full_doc_info{id=Id,update_seq=AccSeq+1,rev_tree=NewRevTree},
@@ -557,8 +635,8 @@ merge_rev_trees(MergeConflicts, [NewDocs|RestDocsList],
             0 -> AccRemoveSeqs;
             _ -> [OldSeq | AccRemoveSeqs]
         end,
-        merge_rev_trees(MergeConflicts, RestDocsList, RestOldInfo,
-                [NewInfo|AccNewInfos], RemoveSeqs, AccSeq+1)
+        merge_rev_trees(Limit, MergeConflicts, RestDocsList, RestOldInfo,
+            [NewInfo|AccNewInfos], RemoveSeqs, AccSeq+1)
     end.
 
 
@@ -581,7 +659,8 @@ update_docs_int(Db, DocsList, NonRepDocs, MergeConflicts, FullCommit) ->
     #db{
         fulldocinfo_by_id_btree = DocInfoByIdBTree,
         docinfo_by_seq_btree = DocInfoBySeqBTree,
-        update_seq = LastSeq
+        update_seq = LastSeq,
+        revs_limit = RevsLimit
         } = Db,
     Ids = [Id || [{_Client, #doc{id=Id}}|_] <- DocsList],
     % lookup up the old documents, if they exist.
@@ -594,10 +673,8 @@ update_docs_int(Db, DocsList, NonRepDocs, MergeConflicts, FullCommit) ->
         end,
         Ids, OldDocLookups),
     % Merge the new docs into the revision trees.
-    {ok, NewDocInfos0, RemoveSeqs, NewSeq} = merge_rev_trees(
+    {ok, NewFullDocInfos, RemoveSeqs, NewSeq} = merge_rev_trees(RevsLimit,
             MergeConflicts, DocsList, OldDocInfos, [], [], LastSeq),
-
-    NewFullDocInfos = stem_full_doc_infos(Db, NewDocInfos0),
 
     % All documents are now ready to write.
 
@@ -621,16 +698,19 @@ update_docs_int(Db, DocsList, NonRepDocs, MergeConflicts, FullCommit) ->
 
     % Check if we just updated any design documents, and update the validation
     % funs if we did.
-    case [1 || <<"_design/",_/binary>> <- Ids] of
-    [] ->
+    case lists:any(
+        fun(<<"_design/", _/binary>>) -> true; (_) -> false end, Ids) of
+    false ->
         Db4 = Db3;
-    _ ->
+    true ->
         Db4 = refresh_validate_doc_funs(Db3)
     end,
 
     {ok, commit_data(Db4, not FullCommit)}.
 
 
+update_local_docs(Db, []) ->
+    {ok, Db};
 update_local_docs(#db{local_docs_btree=Btree}=Db, Docs) ->
     Ids = [Id || {_Client, #doc{id=Id}} <- Docs],
     OldDocLookups = couch_btree:lookup(Btree, Ids),
@@ -692,7 +772,7 @@ commit_data(Db, true) ->
     Db;
 commit_data(Db, _) ->
     #db{
-        fd = Fd,
+        updater_fd = Fd,
         filepath = Filepath,
         header = OldHeader,
         fsync_options = FsyncOptions,
@@ -721,27 +801,18 @@ commit_data(Db, _) ->
     end.
 
 
-copy_doc_attachments(#db{fd=SrcFd}=SrcDb, {Pos,_RevId}, SrcSp, DestFd) ->
-    {ok, {BodyData, BinInfos}} = couch_db:read_doc(SrcDb, SrcSp),
+copy_doc_attachments(#db{updater_fd = SrcFd} = SrcDb, SrcSp, DestFd) ->
+    {ok, {BodyData, BinInfos0}} = couch_db:read_doc(SrcDb, SrcSp),
+    BinInfos = case BinInfos0 of
+    _ when is_binary(BinInfos0) ->
+        couch_compress:decompress(BinInfos0);
+    _ when is_list(BinInfos0) ->
+        % pre 1.2 file format
+        BinInfos0
+    end,
     % copy the bin values
     NewBinInfos = lists:map(
-        fun({Name, {Type, BinSp, AttLen}}) when is_tuple(BinSp) orelse BinSp == null ->
-            % 09 UPGRADE CODE
-            {NewBinSp, AttLen, AttLen, Md5, _IdentityMd5} =
-                couch_stream:old_copy_to_new_stream(SrcFd, BinSp, AttLen, DestFd),
-            {Name, Type, NewBinSp, AttLen, AttLen, Pos, Md5, identity};
-        ({Name, {Type, BinSp, AttLen}}) ->
-            % 09 UPGRADE CODE
-            {NewBinSp, AttLen, AttLen, Md5, _IdentityMd5} =
-                couch_stream:copy_to_new_stream(SrcFd, BinSp, DestFd),
-            {Name, Type, NewBinSp, AttLen, AttLen, Pos, Md5, identity};
-        ({Name, Type, BinSp, AttLen, _RevPos, <<>>}) when
-            is_tuple(BinSp) orelse BinSp == null ->
-            % 09 UPGRADE CODE
-            {NewBinSp, AttLen, AttLen, Md5, _IdentityMd5} =
-                couch_stream:old_copy_to_new_stream(SrcFd, BinSp, AttLen, DestFd),
-            {Name, Type, NewBinSp, AttLen, AttLen, AttLen, Md5, identity};
-        ({Name, Type, BinSp, AttLen, RevPos, Md5}) ->
+        fun({Name, Type, BinSp, AttLen, RevPos, Md5}) ->
             % 010 UPGRADE CODE
             {NewBinSp, AttLen, AttLen, Md5, _IdentityMd5} =
                 couch_stream:copy_to_new_stream(SrcFd, BinSp, DestFd),
@@ -763,36 +834,33 @@ copy_doc_attachments(#db{fd=SrcFd}=SrcDb, {Pos,_RevId}, SrcSp, DestFd) ->
         end, BinInfos),
     {BodyData, NewBinInfos}.
 
-copy_rev_tree_attachments(SrcDb, DestFd, Tree) ->
-    couch_key_tree:map(
-        fun(Rev, {IsDel, Sp, Seq}, leaf) ->
-            DocBody = copy_doc_attachments(SrcDb, Rev, Sp, DestFd),
-            {IsDel, DocBody, Seq};
-        (_, _, branch) ->
-            ?REV_MISSING
-        end, Tree).
-            
-
-copy_docs(Db, #db{fd=DestFd}=NewDb, InfoBySeq, Retry) ->
+copy_docs(Db, #db{updater_fd = DestFd} = NewDb, InfoBySeq0, Retry) ->
+    % COUCHDB-968, make sure we prune duplicates during compaction
+    InfoBySeq = lists:usort(fun(#doc_info{id=A}, #doc_info{id=B}) -> A =< B end,
+        InfoBySeq0),
     Ids = [Id || #doc_info{id=Id} <- InfoBySeq],
     LookupResults = couch_btree:lookup(Db#db.fulldocinfo_by_id_btree, Ids),
 
-    % write out the attachments
-    NewFullDocInfos0 = lists:map(
-        fun({ok, #full_doc_info{rev_tree=RevTree}=Info}) ->
-            Info#full_doc_info{rev_tree=copy_rev_tree_attachments(Db, DestFd, RevTree)}
-        end, LookupResults),
-    % write out the docs
-    % we do this in 2 stages so the docs are written out contiguously, making
-    % view indexing and replication faster.
     NewFullDocInfos1 = lists:map(
-        fun(#full_doc_info{rev_tree=RevTree}=Info) ->
-            Info#full_doc_info{rev_tree=couch_key_tree:map_leafs(
-                fun(_Key, {IsDel, DocBody, Seq}) ->
-                    {ok, Pos} = couch_file:append_term_md5(DestFd, DocBody),
-                    {IsDel, Pos, Seq}
+        fun({ok, #full_doc_info{rev_tree=RevTree}=Info}) ->
+            Info#full_doc_info{rev_tree=couch_key_tree:map(
+                fun(_, _, branch) ->
+                    ?REV_MISSING;
+                (_Rev, LeafVal, leaf) ->
+                    IsDel = element(1, LeafVal),
+                    Sp = element(2, LeafVal),
+                    Seq = element(3, LeafVal),
+                    {_Body, AttsInfo} = Summary = copy_doc_attachments(
+                        Db, Sp, DestFd),
+                    SummaryChunk = make_doc_summary(NewDb, Summary),
+                    {ok, Pos, SummarySize} = couch_file:append_raw_chunk(
+                        DestFd, SummaryChunk),
+                    TotalLeafSize = lists:foldl(
+                        fun({_, _, _, AttLen, _, _, _, _}, S) -> S + AttLen end,
+                        SummarySize, AttsInfo),
+                    {IsDel, Pos, Seq, TotalLeafSize}
                 end, RevTree)}
-        end, NewFullDocInfos0),
+        end, LookupResults),
 
     NewFullDocInfos = stem_full_doc_infos(Db, NewFullDocInfos1),
     NewDocInfos = [couch_doc:to_doc_info(Info) || Info <- NewFullDocInfos],
@@ -811,6 +879,7 @@ copy_docs(Db, #db{fd=DestFd}=NewDb, InfoBySeq, Retry) ->
             NewDb#db.docinfo_by_seq_btree, NewDocInfos, RemoveSeqs),
     {ok, FullDocInfoBTree} = couch_btree:add_remove(
             NewDb#db.fulldocinfo_by_id_btree, NewFullDocInfos, []),
+    update_compact_task(length(NewFullDocInfos)),
     NewDb#db{ fulldocinfo_by_id_btree=FullDocInfoBTree,
               docinfo_by_seq_btree=DocInfoBTree}.
 
@@ -820,36 +889,65 @@ copy_compact(Db, NewDb0, Retry) ->
     FsyncOptions = [Op || Op <- NewDb0#db.fsync_options, Op == before_header],
     NewDb = NewDb0#db{fsync_options=FsyncOptions},
     TotalChanges = couch_db:count_changes_since(Db, NewDb#db.update_seq),
+    BufferSize = list_to_integer(
+        couch_config:get("database_compaction", "doc_buffer_size", "524288")),
+    CheckpointAfter = couch_util:to_integer(
+        couch_config:get("database_compaction", "checkpoint_after",
+            BufferSize * 10)),
+
     EnumBySeqFun =
-    fun(#doc_info{high_seq=Seq}=DocInfo, _Offset, {AccNewDb, AccUncopied, TotalCopied}) ->
-        couch_task_status:update("Copied ~p of ~p changes (~p%)",
-                [TotalCopied, TotalChanges, (TotalCopied*100) div TotalChanges]),
-        if TotalCopied rem 1000 =:= 0 ->
-            NewDb2 = copy_docs(Db, AccNewDb, lists:reverse([DocInfo | AccUncopied]), Retry),
-            if TotalCopied rem 10000 =:= 0 ->
-                {ok, {commit_data(NewDb2#db{update_seq=Seq}), [], TotalCopied + 1}};
+    fun(#doc_info{high_seq=Seq}=DocInfo, _Offset,
+        {AccNewDb, AccUncopied, AccUncopiedSize, AccCopiedSize}) ->
+
+        AccUncopiedSize2 = AccUncopiedSize + ?term_size(DocInfo),
+        if AccUncopiedSize2 >= BufferSize ->
+            NewDb2 = copy_docs(
+                Db, AccNewDb, lists:reverse([DocInfo | AccUncopied]), Retry),
+            AccCopiedSize2 = AccCopiedSize + AccUncopiedSize2,
+            if AccCopiedSize2 >= CheckpointAfter ->
+                {ok, {commit_data(NewDb2#db{update_seq = Seq}), [], 0, 0}};
             true ->
-                {ok, {NewDb2#db{update_seq=Seq}, [], TotalCopied + 1}}
+                {ok, {NewDb2#db{update_seq = Seq}, [], 0, AccCopiedSize2}}
             end;
         true ->
-            {ok, {AccNewDb, [DocInfo | AccUncopied], TotalCopied + 1}}
+            {ok, {AccNewDb, [DocInfo | AccUncopied], AccUncopiedSize2,
+                AccCopiedSize}}
         end
     end,
 
-    couch_task_status:set_update_frequency(500),
+    TaskProps0 = [
+        {type, database_compaction},
+        {database, Db#db.name},
+        {progress, 0},
+        {changes_done, 0},
+        {total_changes, TotalChanges}
+    ],
+    case Retry of
+    true ->
+        couch_task_status:update([
+            {retry, true},
+            {progress, 0},
+            {changes_done, 0},
+            {total_changes, TotalChanges}
+        ]);
+    false ->
+        couch_task_status:add_task(TaskProps0),
+        couch_task_status:set_update_frequency(500)
+    end,
 
-    {ok, _, {NewDb2, Uncopied, TotalChanges}} =
+    {ok, _, {NewDb2, Uncopied, _, _}} =
         couch_btree:foldl(Db#db.docinfo_by_seq_btree, EnumBySeqFun,
-            {NewDb, [], 0},
+            {NewDb, [], 0, 0},
             [{start_key, NewDb#db.update_seq + 1}]),
 
-    couch_task_status:update("Flushing"),
-
     NewDb3 = copy_docs(Db, NewDb2, lists:reverse(Uncopied), Retry),
+    TotalChanges = couch_task_status:get(changes_done),
 
     % copy misc header values
     if NewDb3#db.security /= Db#db.security ->
-        {ok, Ptr} = couch_file:append_term(NewDb3#db.fd, Db#db.security),
+        {ok, Ptr, _} = couch_file:append_term(
+            NewDb3#db.updater_fd, Db#db.security,
+            [{compression, NewDb3#db.compression}]),
         NewDb4 = NewDb3#db{security=Db#db.security, security_ptr=Ptr};
     true ->
         NewDb4 = NewDb3
@@ -857,23 +955,69 @@ copy_compact(Db, NewDb0, Retry) ->
 
     commit_data(NewDb4#db{update_seq=Db#db.update_seq}).
 
-start_copy_compact(#db{name=Name,filepath=Filepath}=Db) ->
+start_copy_compact(#db{name=Name,filepath=Filepath,header=#db_header{purge_seq=PurgeSeq}}=Db) ->
     CompactFile = Filepath ++ ".compact",
     ?LOG_DEBUG("Compaction process spawned for db \"~s\"", [Name]),
     case couch_file:open(CompactFile) of
     {ok, Fd} ->
-        couch_task_status:add_task(<<"Database Compaction">>, <<Name/binary, " retry">>, <<"Starting">>),
         Retry = true,
-        {ok, Header} = couch_file:read_header(Fd);
+        case couch_file:read_header(Fd) of
+        {ok, Header} ->
+            ok;
+        no_valid_header ->
+            ok = couch_file:write_header(Fd, Header=#db_header{})
+        end;
     {error, enoent} ->
-        couch_task_status:add_task(<<"Database Compaction">>, Name, <<"Starting">>),
         {ok, Fd} = couch_file:open(CompactFile, [create]),
         Retry = false,
         ok = couch_file:write_header(Fd, Header=#db_header{})
     end,
-    NewDb = init_db(Name, CompactFile, Fd, Header),
+    ReaderFd = open_reader_fd(CompactFile, Db#db.options),
+    NewDb = init_db(Name, CompactFile, Fd, ReaderFd, Header, Db#db.options),
+    NewDb2 = if PurgeSeq > 0 ->
+        {ok, PurgedIdsRevs} = couch_db:get_last_purged(Db),
+        {ok, Pointer, _} = couch_file:append_term(
+            Fd, PurgedIdsRevs, [{compression, NewDb#db.compression}]),
+        NewDb#db{header=Header#db_header{purge_seq=PurgeSeq, purged_docs=Pointer}};
+    true ->
+        NewDb
+    end,
     unlink(Fd),
-    NewDb2 = copy_compact(Db, NewDb, Retry),
-    close_db(NewDb2),
-    gen_server:cast(Db#db.update_pid, {compact_done, CompactFile}).
 
+    NewDb3 = copy_compact(Db, NewDb2, Retry),
+    close_db(NewDb3),
+    case gen_server:call(
+        Db#db.update_pid, {compact_done, CompactFile}, infinity) of
+    ok ->
+        ok;
+    {retry, CurrentDb} ->
+        start_copy_compact(CurrentDb)
+    end.
+
+update_compact_task(NumChanges) ->
+    [Changes, Total] = couch_task_status:get([changes_done, total_changes]),
+    Changes2 = Changes + NumChanges,
+    Progress = case Total of
+    0 ->
+        0;
+    _ ->
+        (Changes2 * 100) div Total
+    end,
+    couch_task_status:update([{changes_done, Changes2}, {progress, Progress}]).
+
+make_doc_summary(#db{compression = Comp}, {Body0, Atts0}) ->
+    Body = case couch_compress:is_compressed(Body0) of
+    true ->
+        Body0;
+    false ->
+        % pre 1.2 database file format
+        couch_compress:compress(Body0, Comp)
+    end,
+    Atts = case couch_compress:is_compressed(Atts0) of
+    true ->
+        Atts0;
+    false ->
+        couch_compress:compress(Atts0, Comp)
+    end,
+    SummaryBin = ?term_to_bin({Body, Atts}),
+    couch_file:assemble_file_chunk(SummaryBin, couch_util:md5(SummaryBin)).

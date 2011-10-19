@@ -13,38 +13,49 @@
 -define(LOCAL_DOC_PREFIX, "_local/").
 -define(DESIGN_DOC_PREFIX0, "_design").
 -define(DESIGN_DOC_PREFIX, "_design/").
+-define(DEFAULT_COMPRESSION, snappy).
 
 -define(MIN_STR, <<"">>).
 -define(MAX_STR, <<255>>). % illegal utf string
 
--define(JSON_ENCODE(V), couch_util:json_encode(V)).
--define(JSON_DECODE(V), couch_util:json_decode(V)).
+% the lowest possible database sequence number
+-define(LOWEST_SEQ, 0).
+
+-define(JSON_ENCODE(V), ejson:encode(V)).
+-define(JSON_DECODE(V), ejson:decode(V)).
 
 -define(b2l(V), binary_to_list(V)).
 -define(l2b(V), list_to_binary(V)).
+-define(term_to_bin(T), term_to_binary(T, [{minor_version, 1}])).
+-define(term_size(T),
+    try
+        erlang:external_size(T)
+    catch _:_ ->
+        byte_size(?term_to_bin(T))
+    end).
 
 -define(DEFAULT_ATTACHMENT_CONTENT_TYPE, <<"application/octet-stream">>).
 
 -define(LOG_DEBUG(Format, Args),
     case couch_log:debug_on() of
         true ->
-            gen_event:sync_notify(error_logger,
-                {self(), couch_debug, {Format, Args}});
+            couch_log:debug(Format, Args);
         false -> ok
     end).
 
 -define(LOG_INFO(Format, Args),
     case couch_log:info_on() of
         true ->
-            gen_event:sync_notify(error_logger,
-                {self(), couch_info, {Format, Args}});
+            couch_log:info(Format, Args);
         false -> ok
     end).
 
--define(LOG_ERROR(Format, Args),
-    gen_event:sync_notify(error_logger,
-            {self(), couch_error, {Format, Args}})).
+-define(LOG_ERROR(Format, Args), couch_log:error(Format, Args)).
 
+% Tree::term() is really a tree(), but we don't want to require R13B04 yet
+-type branch() :: {Key::term(), Value::term(), Tree::term()}.
+-type path() :: {Start::pos_integer(), branch()}.
+-type tree() :: [branch()]. % sorted by key
 
 -record(rev_info,
     {
@@ -65,7 +76,8 @@
     {id = <<"">>,
     update_seq = 0,
     deleted = false,
-    rev_tree = []
+    rev_tree = [],
+    leafs_size = 0
     }).
 
 -record(httpd,
@@ -137,7 +149,7 @@
 % if the disk revision is incremented, then new upgrade logic will need to be
 % added to couch_db_updater:init_db.
 
--define(LATEST_DISK_VERSION, 5).
+-define(LATEST_DISK_VERSION, 6).
 
 -record(db_header,
     {disk_version = ?LATEST_DISK_VERSION,
@@ -158,6 +170,7 @@
     compactor_pid = nil,
     instance_start_time, % number of microsecs since jan 1 1970 as a binary string
     fd,
+    updater_fd,
     fd_ref_counter,
     header = #db_header{},
     committed_update_seq,
@@ -174,7 +187,8 @@
     waiting_delayed_commit = nil,
     revs_limit = 1000,
     fsync_options = [],
-    is_sys_db = false
+    options = [],
+    compression
     }).
 
 
@@ -194,6 +208,7 @@
 
     view_type = nil,
     include_docs = false,
+    conflicts = false,
     stale = false,
     multi_get = false,
     callback = nil,
@@ -222,12 +237,12 @@
 
 -record(group, {
     sig=nil,
-    db=nil,
     fd=nil,
     name,
     def_lang,
     design_options=[],
     views,
+    lib,
     id_btree=nil,
     current_seq=0,
     purge_seq=0,
@@ -237,6 +252,8 @@
 
 -record(view,
     {id_num,
+    update_seq=0,
+    purge_seq=0,
     map_names=[],
     def,
     btree=nil,
@@ -251,33 +268,6 @@
     view_states=nil
     }).
 
--record(http_db, {
-    url,
-    auth = [],
-    resource = "",
-    headers = [
-        {"User-Agent", "CouchDB/"++couch_server:get_version()},
-        {"Accept", "application/json"},
-        {"Accept-Encoding", "gzip"}
-    ],
-    qs = [],
-    method = get,
-    body = nil,
-    options = [
-        {response_format,binary},
-        {inactivity_timeout, 30000},
-        {max_sessions, list_to_integer(
-            couch_config:get("replicator", "max_http_sessions", "10")
-        )},
-        {max_pipeline_size, list_to_integer(
-            couch_config:get("replicator", "max_http_pipeline_size", "10")
-        )}
-    ],
-    retries = 10,
-    pause = 500,
-    conn = nil
-}).
-
 % small value used in revision trees to indicate the revision isn't stored
 -define(REV_MISSING, []).
 
@@ -290,7 +280,19 @@
     heartbeat,
     timeout,
     filter = "",
+    filter_fun,
+    filter_args = [],
     include_docs = false,
+    conflicts = false,
     db_open_options = []
 }).
 
+-record(btree, {
+    fd,
+    root,
+    extract_kv = fun({_Key, _Value} = KV) -> KV end,
+    assemble_kv = fun(Key, Value) -> {Key, Value} end,
+    less = fun(A, B) -> A < B end,
+    reduce = nil,
+    compression = ?DEFAULT_COMPRESSION
+}).

@@ -62,7 +62,7 @@ couchTests.users_db = function(debug) {
     T(usersDb.save(jchrisUser2).ok);
     try {
       usersDb.save(jchrisUserDoc);
-      T(false && "should be an update conflict")
+      T(false && "should be an update conflict");
     } catch(e) {
       T(true);
     }
@@ -70,7 +70,7 @@ couchTests.users_db = function(debug) {
     var resp = usersDb.bulkSave([jchrisUserDoc],{all_or_nothing : true});
     
     var jchrisWithConflict = usersDb.open(jchrisUserDoc._id, {conflicts : true});
-    T(jchrisWithConflict._conflicts.length == 1)
+    T(jchrisWithConflict._conflicts.length == 1);
     
     // no login with conflicted user doc
     try {
@@ -79,10 +79,10 @@ couchTests.users_db = function(debug) {
           "Authorization" : "Basic amNocmlzQGFwYWNoZS5vcmc6ZnVubnlib25l"
         }
       });
-      T(false && "this will throw")
+      T(false && "this will throw");
     } catch(e) {
-      T(e.error == "unauthorized")
-      T(/conflict/.test(e.reason))
+      T(e.error == "unauthorized");
+      T(/conflict/.test(e.reason));
     }
 
     // you can delete a user doc
@@ -90,6 +90,38 @@ couchTests.users_db = function(debug) {
     T(s.name == null);
     T(s.roles.indexOf("_admin") !== -1);
     T(usersDb.deleteDoc(jchrisWithConflict).ok);
+
+    // you can't change doc from type "user"
+    jchrisUserDoc = usersDb.open(jchrisUserDoc._id);
+    jchrisUserDoc.type = "not user";
+    try {
+      usersDb.save(jchrisUserDoc);
+      T(false && "should only allow us to save doc when type == 'user'");
+    } catch(e) {
+      T(e.reason == "doc.type must be user");
+    }
+    jchrisUserDoc.type = "user";
+
+    // "roles" must be an array
+    jchrisUserDoc.roles = "not an array";
+    try {
+      usersDb.save(jchrisUserDoc);
+      T(false && "should only allow us to save doc when roles is an array");
+    } catch(e) {
+      T(e.reason == "doc.roles must be an array");
+    }
+    jchrisUserDoc.roles = [];
+
+    // character : is not allowed in usernames
+    var joeUserDoc = CouchDB.prepareUserDoc({
+      name: "joe:erlang"
+    }, "qwerty");
+    try {
+      usersDb.save(joeUserDoc);
+      T(false, "shouldn't allow : in usernames");
+    } catch(e) {
+      TEquals("Character `:` is not allowed in usernames.", e.reason);
+    }
   };
 
   usersDb.deleteDb();

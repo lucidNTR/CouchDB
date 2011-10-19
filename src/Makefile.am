@@ -10,4 +10,13 @@
 ## License for the specific language governing permissions and limitations under
 ## the License.
 
-SUBDIRS = couchdb erlang-oauth etap ibrowse mochiweb
+SUBDIRS = \
+    couch_index \
+    couch_mrview \
+    couchdb \
+    ejson \
+    erlang-oauth \
+    etap \
+    ibrowse \
+    mochiweb \
+    snappy

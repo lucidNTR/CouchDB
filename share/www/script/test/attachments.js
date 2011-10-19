@@ -99,12 +99,21 @@ couchTests.attachments= function(debug) {
   T(xhr.responseText == bin_data);
   TEqualsIgnoreCase("text/plain;charset=utf-8", xhr.getResponseHeader("Content-Type"));
 
+  // without rev
   var xhr = CouchDB.request("PUT", "/test_suite_db/bin_doc3/attachment.txt", {
     headers:{"Content-Type":"text/plain;charset=utf-8"},
     body:bin_data
   });
   T(xhr.status == 409);
 
+  // with nonexistent rev
+  var xhr = CouchDB.request("PUT", "/test_suite_db/bin_doc3/attachment.txt"  + "?rev=1-adae8575ecea588919bd08eb020c708e", {
+    headers:{"Content-Type":"text/plain;charset=utf-8"},
+    body:bin_data
+  });
+  T(xhr.status == 409);
+
+  // with current rev
   var xhr = CouchDB.request("PUT", "/test_suite_db/bin_doc3/attachment.txt?rev=" + rev, {
     headers:{"Content-Type":"text/plain;charset=utf-8"},
     body:bin_data
@@ -272,4 +281,17 @@ couchTests.attachments= function(debug) {
   } catch (e) {
       T(e.error == "missing_stub");
   }
+
+  // test MD5 header
+  var bin_data = "foo bar"
+  var xhr = CouchDB.request("PUT", "/test_suite_db/bin_doc7/attachment.txt", {
+    headers:{"Content-Type":"application/octet-stream",
+             "Content-MD5":"MntvB0NYESObxH4VRDUycw=="},
+    body:bin_data
+  });
+  TEquals(201, xhr.status);
+
+  var xhr = CouchDB.request("GET", "/test_suite_db/bin_doc7/attachment.txt");
+  TEquals('MntvB0NYESObxH4VRDUycw==', xhr.getResponseHeader("Content-MD5"));
+
 };

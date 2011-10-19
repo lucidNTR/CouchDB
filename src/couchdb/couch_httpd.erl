@@ -13,16 +13,19 @@
 -module(couch_httpd).
 -include("couch_db.hrl").
 
--export([start_link/0, start_link/1, stop/0, handle_request/5]).
+-export([start_link/0, start_link/1, stop/0, config_change/2, 
+        handle_request/5]).
 
--export([header_value/2,header_value/3,qs_value/2,qs_value/3,qs/1,path/1,absolute_uri/2,body_length/1]).
+-export([header_value/2,header_value/3,qs_value/2,qs_value/3,qs/1,qs_json_value/3]).
+-export([path/1,absolute_uri/2,body_length/1]).
 -export([verify_is_server_admin/1,unquote/1,quote/1,recv/2,recv_chunked/4,error_info/1]).
 -export([make_fun_spec_strs/1]).
 -export([make_arity_1_fun/1, make_arity_2_fun/1, make_arity_3_fun/1]).
--export([parse_form/1,json_body/1,json_body_obj/1,body/1,doc_etag/1, make_etag/1, etag_respond/3]).
+-export([parse_form/1,json_body/1,json_body_obj/1,body/1]).
+-export([doc_etag/1, make_etag/1, etag_match/2, etag_respond/3, etag_maybe/2]).
 -export([primary_header_value/2,partition/1,serve_file/3,serve_file/4, server_header/0]).
 -export([start_chunked_response/3,send_chunk/2,log_request/2]).
--export([start_response_length/4, send/2]).
+-export([start_response_length/4, start_response/3, send/2]).
 -export([start_json_response/2, start_json_response/3, end_json_response/1]).
 -export([send_response/4,send_method_not_allowed/2,send_error/4, send_redirect/2,send_chunked_error/2]).
 -export([send_json/2,send_json/3,send_json/4,last_chunk/1,parse_multipart_request/3]).
@@ -34,20 +37,58 @@ start_link(http) ->
     Port = couch_config:get("httpd", "port", "5984"),
     start_link(?MODULE, [{port, Port}]);
 start_link(https) ->
-    Port = couch_config:get("ssl", "port", "5984"),
+    Port = couch_config:get("ssl", "port", "6984"),
     CertFile = couch_config:get("ssl", "cert_file", nil),
     KeyFile = couch_config:get("ssl", "key_file", nil),
     Options = case CertFile /= nil andalso KeyFile /= nil of
-                  true ->
-                      [{port, Port},
-                       {ssl, true},
-                       {ssl_opts, [
-                             {certfile, CertFile},
-                             {keyfile, KeyFile}]}];
-                  false ->
-                      io:format("SSL enabled but PEM certificates are missing.", []),
-                      throw({error, missing_certs})
-              end,
+        true ->
+            SslOpts = [{certfile, CertFile}, {keyfile, KeyFile}],
+
+            %% set password if one is needed for the cert
+            SslOpts1 = case couch_config:get("ssl", "password", nil) of
+                nil -> SslOpts;
+                Password ->
+                    SslOpts ++ [{password, Password}]
+            end,
+            % do we verify certificates ?
+            FinalSslOpts = case couch_config:get("ssl",
+                    "verify_ssl_certificates", false) of
+                false -> SslOpts1;
+                _ ->
+                    case couch_config:get("ssl",
+                            "cacert_file", nil) of
+                        nil ->
+                            io:format("Verify SSL certificate "
+                                ++"enabled but file containing "
+                                ++"PEM encoded CA certificates is "
+                                ++"missing", []),
+                            throw({error, missing_cacerts});
+                        CaCertFile ->
+                            Depth = list_to_integer(couch_config:get("ssl",
+                                    "ssl_certificate_max_depth",
+                                    "1")),
+                            FinalOpts = [
+                                {cacertfile, CaCertFile},
+                                {depth, Depth},
+                                {verify, verify_peer}],
+                            % allows custom verify fun.
+                            case couch_config:get("ssl",
+                                    "verify_fun", nil) of
+                                nil -> FinalOpts;
+                                SpecStr ->
+                                    FinalOpts 
+                                    ++ [{verify_fun, make_arity_3_fun(SpecStr)}]
+                            end
+                    end
+            end,
+            
+            [{port, Port},
+                {ssl, true},
+                {ssl_opts, FinalSslOpts}];
+        false ->
+            io:format("SSL enabled but PEM certificates are missing.", []),
+            throw({error, missing_certs})
+    end,
     start_link(https, Options).
 start_link(Name, Options) ->
     % read config and register for configuration changes
@@ -56,8 +97,6 @@ start_link(Name, Options) ->
     % will restart us and then we will pick up the new settings.
 
     BindAddress = couch_config:get("httpd", "bind_address", any),
-    NoDelay = "true" == couch_config:get("httpd", "nodelay", "false"),
-
     DefaultSpec = "{couch_httpd_db, handle_request}",
     DefaultFun = make_arity_1_fun(
         couch_config:get("httpd", "default_handler", DefaultSpec)
@@ -81,46 +120,72 @@ start_link(Name, Options) ->
     UrlHandlers = dict:from_list(UrlHandlersList),
     DbUrlHandlers = dict:from_list(DbUrlHandlersList),
     DesignUrlHandlers = dict:from_list(DesignUrlHandlersList),
+    {ok, ServerOptions} = couch_util:parse_term(
+        couch_config:get("httpd", "server_options", "[]")),
+    {ok, SocketOptions} = couch_util:parse_term(
+        couch_config:get("httpd", "socket_options", "[]")),
+
+    set_auth_handlers(),
+
     Loop = fun(Req)->
+        case SocketOptions of
+        [] ->
+            ok;
+        _ ->
+            ok = mochiweb_socket:setopts(Req:get(socket), SocketOptions)
+        end,
         apply(?MODULE, handle_request, [
             Req, DefaultFun, UrlHandlers, DbUrlHandlers, DesignUrlHandlers
         ])
     end,
 
-    % and off we go
+    % set mochiweb options
+    FinalOptions = lists:append([Options, ServerOptions, [
+            {loop, Loop},
+            {name, Name},
+            {ip, BindAddress}]]),
 
-    {ok, Pid} = case mochiweb_http:start(Options ++ [
-        {loop, Loop},
-        {name, Name},
-        {ip, BindAddress},
-        {nodelay,NoDelay}
-    ]) of
-    {ok, MochiPid} -> {ok, MochiPid};
-    {error, Reason} ->
-        io:format("Failure to start Mochiweb: ~s~n",[Reason]),
-        throw({error, Reason})
+    % launch mochiweb
+    {ok, Pid} = case mochiweb_http:start(FinalOptions) of
+        {ok, MochiPid} -> 
+            {ok, MochiPid};
+        {error, Reason} ->
+            io:format("Failure to start Mochiweb: ~s~n",[Reason]),
+            throw({error, Reason})
     end,
 
-    ok = couch_config:register(
-        fun("httpd", "bind_address") ->
-            ?MODULE:stop();
-        ("httpd", "port") ->
-            ?MODULE:stop();
-        ("httpd", "max_connections") ->
-            ?MODULE:stop();
-        ("httpd", "default_handler") ->
-            ?MODULE:stop();
-        ("httpd_global_handlers", _) ->
-            ?MODULE:stop();
-        ("httpd_db_handlers", _) ->
-            ?MODULE:stop();
-        ("vhosts", _) ->
-            ?MODULE:stop();
-        ("ssl", _) ->
-            ?MODULE:stop()
-        end, Pid),
-
+    ok = couch_config:register(fun ?MODULE:config_change/2, Pid),
     {ok, Pid}.
+
+
+stop() ->
+    mochiweb_http:stop(?MODULE).
+
+config_change("httpd", "bind_address") ->
+    ?MODULE:stop();
+config_change("httpd", "port") ->
+    ?MODULE:stop();
+config_change("httpd", "default_handler") ->
+    ?MODULE:stop();
+config_change("httpd", "server_options") ->
+    ?MODULE:stop();
+config_change("httpd", "socket_options") ->
+    ?MODULE:stop();
+config_change("httpd", "authentication_handlers") ->
+    set_auth_handlers();
+config_change("httpd_global_handlers", _) ->
+    ?MODULE:stop();
+config_change("httpd_db_handlers", _) ->
+    ?MODULE:stop();
+config_change("ssl", _) ->
+    ?MODULE:stop().
+
+set_auth_handlers() ->
+    AuthenticationSrcs = make_fun_spec_strs(
+        couch_config:get("httpd", "authentication_handlers", "")),
+    AuthHandlers = lists:map(
+        fun(A) -> {make_arity_1_fun(A), ?l2b(A)} end, AuthenticationSrcs),
+    ok = application:set_env(couch, auth_handlers, AuthHandlers).
 
 % SpecStr is a string like "{my_module, my_fun}"
 %  or "{my_module, my_fun, <<"my_arg">>}"
@@ -152,22 +217,17 @@ make_arity_3_fun(SpecStr) ->
 make_fun_spec_strs(SpecStr) ->
     re:split(SpecStr, "(?<=})\\s*,\\s*(?={)", [{return, list}]).
 
-stop() ->
-    mochiweb_http:stop(?MODULE).
-
-
 handle_request(MochiReq, DefaultFun, UrlHandlers, DbUrlHandlers, 
     DesignUrlHandlers) ->
 
-    MochiReq1 = couch_httpd_vhost:match_vhost(MochiReq),
+    MochiReq1 = couch_httpd_vhost:dispatch_host(MochiReq),
+    
     handle_request_int(MochiReq1, DefaultFun,
                 UrlHandlers, DbUrlHandlers, DesignUrlHandlers).
 
 handle_request_int(MochiReq, DefaultFun,
             UrlHandlers, DbUrlHandlers, DesignUrlHandlers) ->
     Begin = now(),
-    AuthenticationSrcs = make_fun_spec_strs(
-            couch_config:get("httpd", "authentication_handlers")),
     % for the path, use the raw path with the query string and fragment
     % removed, but URL quoting left intact
     RawUri = MochiReq:get(raw_path),
@@ -225,7 +285,7 @@ handle_request_int(MochiReq, DefaultFun,
 
     % alias HEAD to GET as mochiweb takes care of stripping the body
     Method = case Method2 of
-            'HEAD' -> 'GET';
+        'HEAD' -> 'GET';
         Other -> Other
     end,
 
@@ -233,10 +293,9 @@ handle_request_int(MochiReq, DefaultFun,
         mochi_req = MochiReq,
         peer = MochiReq:get(peer),
         method = Method,
-        requested_path_parts = [list_to_binary(couch_httpd:unquote(Part))
-                || Part <- string:tokens(RequestedPath, "/")],
-        path_parts = [list_to_binary(couch_httpd:unquote(Part))
-                || Part <- string:tokens(Path, "/")],
+        requested_path_parts =
+            [?l2b(unquote(Part)) || Part <- string:tokens(RequestedPath, "/")],
+        path_parts = [?l2b(unquote(Part)) || Part <- string:tokens(Path, "/")],
         db_url_handlers = DbUrlHandlers,
         design_url_handlers = DesignUrlHandlers,
         default_fun = DefaultFun,
@@ -244,10 +303,11 @@ handle_request_int(MochiReq, DefaultFun,
     },
 
     HandlerFun = couch_util:dict_find(HandlerKey, UrlHandlers, DefaultFun),
+    {ok, AuthHandlers} = application:get_env(couch, auth_handlers),
 
     {ok, Resp} =
     try
-        case authenticate_request(HttpReq, AuthenticationSrcs) of
+        case authenticate_request(HttpReq, AuthHandlers) of
         #httpd{} = Req ->
             HandlerFun(Req);
         Response ->
@@ -268,6 +328,11 @@ handle_request_int(MochiReq, DefaultFun,
             send_error(HttpReq, bad_request);
         exit:normal ->
             exit(normal);
+        exit:snappy_nif_not_loaded ->
+            ErrorReason = "To access the database or view index, Apache CouchDB"
+                " must be built with Erlang OTP R13B04 or higher.",
+            ?LOG_ERROR("~s", [ErrorReason]),
+            send_error(HttpReq, {bad_otp_release, ErrorReason});
         throw:Error ->
             ?LOG_DEBUG("Minor error in HTTP request: ~p",[Error]),
             ?LOG_DEBUG("Stacktrace: ~p",[erlang:get_stacktrace()]),
@@ -293,7 +358,7 @@ handle_request_int(MochiReq, DefaultFun,
 % Try authentication handlers in order until one sets a user_ctx
 % the auth funs also have the option of returning a response
 % move this to couch_httpd_auth?
-authenticate_request(#httpd{user_ctx=#user_ctx{}} = Req, _AuthSrcs) ->
+authenticate_request(#httpd{user_ctx=#user_ctx{}} = Req, _AuthHandlers) ->
     Req;
 authenticate_request(#httpd{} = Req, []) ->
     case couch_config:get("couch_httpd_auth", "require_valid_user", "false") of
@@ -302,14 +367,13 @@ authenticate_request(#httpd{} = Req, []) ->
     "false" ->
         Req#httpd{user_ctx=#user_ctx{}}
     end;
-authenticate_request(#httpd{} = Req, [AuthSrc|Rest]) ->
-    AuthFun = make_arity_1_fun(AuthSrc),
+authenticate_request(#httpd{} = Req, [{AuthFun, AuthSrc} | RestAuthHandlers]) ->
     R = case AuthFun(Req) of
         #httpd{user_ctx=#user_ctx{}=UserCtx}=Req2 ->
-            Req2#httpd{user_ctx=UserCtx#user_ctx{handler=?l2b(AuthSrc)}};
+            Req2#httpd{user_ctx=UserCtx#user_ctx{handler=AuthSrc}};
         Else -> Else
     end,
-    authenticate_request(R, Rest);
+    authenticate_request(R, RestAuthHandlers);
 authenticate_request(Response, _AuthSrcs) ->
     Response.
 
@@ -331,12 +395,11 @@ validate_referer(Req) ->
     end.
 
 validate_ctype(Req, Ctype) ->
-    case couch_httpd:header_value(Req, "Content-Type") of
+    case header_value(Req, "Content-Type") of
     undefined ->
         throw({bad_ctype, "Content-Type must be "++Ctype});
     ReqCtype ->
-        % ?LOG_ERROR("Ctype ~p ReqCtype ~p",[Ctype,ReqCtype]),
-        case re:split(ReqCtype, ";", [{return, list}]) of
+        case string:tokens(ReqCtype, ";") of
         [Ctype] -> ok;
         [Ctype, _Rest] -> ok;
         _Else ->
@@ -375,6 +438,7 @@ serve_file(Req, RelativePath, DocumentRoot) ->
     serve_file(Req, RelativePath, DocumentRoot, []).
 
 serve_file(#httpd{mochi_req=MochiReq}=Req, RelativePath, DocumentRoot, ExtraHeaders) ->
+    log_request(Req, 200),
     {ok, MochiReq:serve_file(RelativePath, DocumentRoot,
         server_header() ++ couch_httpd_auth:cookie_auth_header(Req, []) ++ ExtraHeaders)}.
 
@@ -383,6 +447,14 @@ qs_value(Req, Key) ->
 
 qs_value(Req, Key, Default) ->
     couch_util:get_value(Key, qs(Req), Default).
+
+qs_json_value(Req, Key, Default) ->
+    case qs_value(Req, Key, Default) of
+    Default ->
+        Default;
+    Result ->
+        ?JSON_DECODE(Result)
+    end.
 
 qs(#httpd{mochi_req=MochiReq}) ->
     MochiReq:parse_qs().
@@ -451,16 +523,24 @@ body_length(Req) ->
         Unknown -> {unknown_transfer_encoding, Unknown}
     end.
 
-body(#httpd{mochi_req=MochiReq, req_body=ReqBody}) ->
-    case ReqBody of
+body(#httpd{mochi_req=MochiReq, req_body=undefined} = Req) ->
+    case body_length(Req) of
         undefined ->
-            % Maximum size of document PUT request body (4GB)
             MaxSize = list_to_integer(
                 couch_config:get("couchdb", "max_document_size", "4294967296")),
             MochiReq:recv_body(MaxSize);
-        _Else ->
-            ReqBody
-    end.
+        chunked ->
+            ChunkFun = fun({0, _Footers}, Acc) ->
+                lists:reverse(Acc);
+            ({_Len, Chunk}, Acc) ->
+                [Chunk | Acc]
+            end,
+            recv_chunked(Req, 8192, ChunkFun, []);
+        Len ->
+            MochiReq:recv_body(Len)
+    end;
+body(#httpd{req_body=ReqBody}) ->
+    ReqBody.
 
 json_body(Httpd) ->
     ?JSON_DECODE(body(Httpd)).
@@ -479,24 +559,32 @@ doc_etag(#doc{revs={Start, [DiskRev|_]}}) ->
 
 make_etag(Term) ->
     <<SigInt:128/integer>> = couch_util:md5(term_to_binary(Term)),
-    list_to_binary("\"" ++ lists:flatten(io_lib:format("~.36B",[SigInt])) ++ "\"").
+    iolist_to_binary([$", io_lib:format("~.36B", [SigInt]), $"]).
 
 etag_match(Req, CurrentEtag) when is_binary(CurrentEtag) ->
     etag_match(Req, binary_to_list(CurrentEtag));
 
 etag_match(Req, CurrentEtag) ->
     EtagsToMatch = string:tokens(
-        couch_httpd:header_value(Req, "If-None-Match", ""), ", "),
+        header_value(Req, "If-None-Match", ""), ", "),
     lists:member(CurrentEtag, EtagsToMatch).
 
 etag_respond(Req, CurrentEtag, RespFun) ->
     case etag_match(Req, CurrentEtag) of
     true ->
         % the client has this in their cache.
-        couch_httpd:send_response(Req, 304, [{"Etag", CurrentEtag}], <<>>);
+        send_response(Req, 304, [{"ETag", CurrentEtag}], <<>>);
     false ->
         % Run the function.
         RespFun()
+    end.
+
+etag_maybe(Req, RespFun) ->
+    try
+        RespFun()
+    catch
+        throw:{etag_match, ETag} ->
+            send_response(Req, 304, [{"ETag", ETag}], <<>>)
     end.
 
 verify_is_server_admin(#httpd{user_ctx=UserCtx}) ->
@@ -508,11 +596,11 @@ verify_is_server_admin(#user_ctx{roles=Roles}) ->
     end.
 
 log_request(#httpd{mochi_req=MochiReq,peer=Peer}, Code) ->
-    ?LOG_INFO("~s - - ~p ~s ~B", [
+    ?LOG_INFO("~s - - ~s ~s ~B", [
         Peer,
-        couch_util:to_existing_atom(MochiReq:get(method)),
+        MochiReq:get(method),
         MochiReq:get(raw_path),
-        couch_util:to_integer(Code)
+        Code
     ]).
 
 
@@ -523,6 +611,18 @@ start_response_length(#httpd{mochi_req=MochiReq}=Req, Code, Headers, Length) ->
     case MochiReq:get(method) of
     'HEAD' -> throw({http_head_abort, Resp});
     _ -> ok
+    end,
+    {ok, Resp}.
+
+start_response(#httpd{mochi_req=MochiReq}=Req, Code, Headers) ->
+    log_request(Req, Code),
+    couch_stats_collector:increment({httpd_status_cdes, Code}),
+    CookieHeader = couch_httpd_auth:cookie_auth_header(Req, Headers),
+    Headers2 = Headers ++ server_header() ++ CookieHeader,
+    Resp = MochiReq:start_response({Code, Headers2}),
+    case MochiReq:get(method) of
+        'HEAD' -> throw({http_head_abort, Resp});
+        _ -> ok
     end,
     {ok, Resp}.
 
@@ -589,27 +689,25 @@ send_json(Req, Code, Value) ->
     send_json(Req, Code, [], Value).
 
 send_json(Req, Code, Headers, Value) ->
+    initialize_jsonp(Req),
     DefaultHeaders = [
         {"Content-Type", negotiate_content_type(Req)},
         {"Cache-Control", "must-revalidate"}
     ],
-    Body = list_to_binary(
-        [start_jsonp(Req), ?JSON_ENCODE(Value), end_jsonp(), $\n]
-    ),
+    Body = [start_jsonp(), ?JSON_ENCODE(Value), end_jsonp(), $\n],
     send_response(Req, Code, DefaultHeaders ++ Headers, Body).
 
 start_json_response(Req, Code) ->
     start_json_response(Req, Code, []).
 
 start_json_response(Req, Code, Headers) ->
+    initialize_jsonp(Req),
     DefaultHeaders = [
         {"Content-Type", negotiate_content_type(Req)},
         {"Cache-Control", "must-revalidate"}
     ],
-    start_jsonp(Req), % Validate before starting chunked.
-    %start_chunked_response(Req, Code, DefaultHeaders ++ Headers).
     {ok, Resp} = start_chunked_response(Req, Code, DefaultHeaders ++ Headers),
-    case start_jsonp(Req) of
+    case start_jsonp() of
         [] -> ok;
         Start -> send_chunk(Resp, Start)
     end,
@@ -619,7 +717,7 @@ end_json_response(Resp) ->
     send_chunk(Resp, end_jsonp() ++ [$\n]),
     last_chunk(Resp).
 
-start_jsonp(Req) ->
+initialize_jsonp(Req) ->
     case get(jsonp) of
         undefined -> put(jsonp, qs_value(Req, "callback", no_jsonp));
         _ -> ok
@@ -632,14 +730,9 @@ start_jsonp(Req) ->
                 % make sure jsonp is configured on (default off)
                 case couch_config:get("httpd", "allow_jsonp", "false") of
                 "true" ->
-                    validate_callback(CallBack),
-                    CallBack ++ "(";
+                    validate_callback(CallBack);
                 _Else ->
-                    % this could throw an error message, but instead we just ignore the
-                    % jsonp parameter
-                    % throw({bad_request, <<"JSONP must be configured before using.">>})
-                    put(jsonp, no_jsonp),
-                    []
+                    put(jsonp, no_jsonp)
                 end
             catch
                 Error ->
@@ -648,14 +741,19 @@ start_jsonp(Req) ->
             end
     end.
 
+start_jsonp() ->
+    case get(jsonp) of
+        no_jsonp -> [];
+        [] -> [];
+        CallBack -> CallBack ++ "("
+    end.
+
 end_jsonp() ->
-    Resp = case get(jsonp) of
+    case erlang:erase(jsonp) of
         no_jsonp -> [];
         [] -> [];
         _ -> ");"
-    end,
-    put(jsonp, undefined),
-    Resp.
+    end.
 
 validate_callback(CallBack) when is_binary(CallBack) ->
     validate_callback(binary_to_list(CallBack));
@@ -736,25 +834,29 @@ error_headers(#httpd{mochi_req=MochiReq}=Req, Code, ErrorStr, ReasonStr) ->
                             % send the browser popup header no matter what if we are require_valid_user
                             {Code, [{"WWW-Authenticate", "Basic realm=\"server\""}]};
                         _False ->
-                            % if the accept header matches html, then do the redirect. else proceed as usual.
-                            Accepts = case MochiReq:get_header_value("Accept") of
-                            undefined ->
-                               % According to the HTTP 1.1 spec, if the Accept
-                               % header is missing, it means the client accepts
-                               % all media types.
-                               "html";
-                            Else ->
-                                Else
-                            end,
-                            case re:run(Accepts, "\\bhtml\\b",
-                                    [{capture, none}, caseless]) of
-                            nomatch ->
+                            case MochiReq:accepts_content_type("application/json") of
+                            true ->
                                 {Code, []};
-                            match ->
-                                AuthRedirectBin = ?l2b(AuthRedirect),
-                                UrlReturn = ?l2b(couch_util:url_encode(MochiReq:get(path))),
-                                UrlReason = ?l2b(couch_util:url_encode(ReasonStr)),
-                                {302, [{"Location", couch_httpd:absolute_uri(Req, <<AuthRedirectBin/binary,"?return=",UrlReturn/binary,"&reason=",UrlReason/binary>>)}]}
+                            false ->
+                                case MochiReq:accepts_content_type("text/html") of
+                                true ->
+                                    % Redirect to the path the user requested, not
+                                    % the one that is used internally.
+                                    UrlReturnRaw = case MochiReq:get_header_value("x-couchdb-vhost-path") of
+                                    undefined ->
+                                        MochiReq:get(path);
+                                    VHostPath ->
+                                        VHostPath
+                                    end,
+                                    RedirectLocation = lists:flatten([
+                                        AuthRedirect,
+                                        "?return=", couch_util:url_encode(UrlReturnRaw),
+                                        "&reason=", couch_util:url_encode(ReasonStr)
+                                    ]),
+                                    {302, [{"Location", absolute_uri(Req, RedirectLocation)}]};
+                                false ->
+                                    {Code, []}
+                                end
                             end
                         end
                     end;
@@ -801,10 +903,16 @@ send_chunked_error(Resp, Error) ->
     last_chunk(Resp).
 
 send_redirect(Req, Path) ->
-     Headers = [{"Location", couch_httpd:absolute_uri(Req, Path)}],
-     send_response(Req, 301, Headers, <<>>).
+     send_response(Req, 301, [{"Location", absolute_uri(Req, Path)}], <<>>).
 
-negotiate_content_type(#httpd{mochi_req=MochiReq}) ->
+negotiate_content_type(Req) ->
+    case get(jsonp) of
+        no_jsonp -> negotiate_content_type1(Req);
+        [] -> negotiate_content_type1(Req);
+        _Callback -> "text/javascript"
+    end.
+
+negotiate_content_type1(#httpd{mochi_req=MochiReq}) ->
     %% Determine the appropriate Content-Type header for a JSON response
     %% depending on the Accept header in the request. A request that explicitly
     %% lists the correct JSON MIME type will get that type, otherwise the
@@ -815,13 +923,12 @@ negotiate_content_type(#httpd{mochi_req=MochiReq}) ->
     end,
     case lists:member("application/json", AcceptedTypes) of
         true  -> "application/json";
-        false -> "text/plain;charset=utf-8"
+        false -> "text/plain; charset=utf-8"
     end.
 
 server_header() ->
-    OTPVersion = "R" ++ integer_to_list(erlang:system_info(compat_rel)) ++ "B",
     [{"Server", "CouchDB/" ++ couch_server:get_version() ++
-                " (Erlang OTP/" ++ OTPVersion ++ ")"}].
+                " (Erlang OTP/" ++ erlang:system_info(otp_release) ++ ")"}].
 
 
 -record(mp, {boundary, buffer, data_fun, callback}).
@@ -835,13 +942,13 @@ parse_multipart_request(ContentType, DataFun, Callback) ->
             data_fun=DataFun,
             callback=Callback},
     {Mp2, _NilCallback} = read_until(Mp, <<"--", Boundary0/binary>>,
-        fun(Next)-> nil_callback(Next) end),
+        fun nil_callback/1),
     #mp{buffer=Buffer, data_fun=DataFun2, callback=Callback2} =
             parse_part_header(Mp2),
     {Buffer, DataFun2, Callback2}.
 
 nil_callback(_Data)->
-    fun(Next) -> nil_callback(Next) end.
+    fun nil_callback/1.
 
 get_boundary({"multipart/" ++ _, Opts}) ->
     case couch_util:get_value("boundary", Opts) of

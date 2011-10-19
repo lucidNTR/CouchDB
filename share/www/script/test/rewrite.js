@@ -91,27 +91,6 @@ couchTests.rewrite = function(debug) {
              }
             },
             {
-             "from": "/type/<type>.json",
-             "to": "_show/type/:type",
-             "query": {
-                 "format": "json"
-             }
-            },
-            {
-             "from": "/type/<type>.xml",
-             "to": "_show/type/:type",
-             "query": {
-                 "format": "xml"
-             }
-            },
-            {
-             "from": "/type/<type>",
-             "to": "_show/type/:type",
-             "query": {
-                 "format": "html"
-             }
-            },
-            {
              "from": "/welcome5/*",
              "to" : "_show/*",
              "query": {
@@ -140,6 +119,10 @@ couchTests.rewrite = function(debug) {
               "query": {
                 "startkey": ":start",
                 "endkey": ":end"
+              },
+              "formats": {
+                "start": "int",
+                "end": "int"
               }
             },
             {
@@ -185,6 +168,18 @@ couchTests.rewrite = function(debug) {
               }
             },
             {
+              "from": "simpleForm/complexView7/:a/:b",
+              "to": "_view/complexView3",
+              "query": {
+                "key": [":a", ":b"],
+                "include_docs": ":doc"
+              },
+              "format": {
+                "doc": "bool"
+              }
+
+            },
+            {
               "from": "/",
               "to": "_view/basicView",
             }
@@ -214,9 +209,6 @@ couchTests.rewrite = function(debug) {
             }),
             "welcome3": stringFun(function(doc,req) {
               return "Welcome " + req.query["name"];
-            }),
-            "type": stringFun(function(doc, req) {
-                return req.id + " as " + req.query.format;
             })
           },
           updates: {
@@ -372,14 +364,14 @@ couchTests.rewrite = function(debug) {
         T(!(/Key: 1/.test(xhr.responseText)));
         T(/FirstKey: 3/.test(xhr.responseText));
         T(/LastKey: 8/.test(xhr.responseText));
-        
+       
         // get with query params
         xhr = CouchDB.request("GET", "/test_suite_db/_design/test/_rewrite/simpleForm/basicViewPath/3/8");
         T(xhr.status == 200, "with query params");
         T(!(/Key: 1/.test(xhr.responseText)));
         T(/FirstKey: 3/.test(xhr.responseText));
         T(/LastKey: 8/.test(xhr.responseText));
-        
+
         // get with query params        
         xhr = CouchDB.request("GET", "/test_suite_db/_design/test/_rewrite/simpleForm/complexView");
         T(xhr.status == 200, "with query params");
@@ -405,14 +397,10 @@ couchTests.rewrite = function(debug) {
         T(xhr.status == 200, "with query params");
         T(/Value: doc 4/.test(xhr.responseText));
 
-        req = CouchDB.request("GET", "/test_suite_db/_design/test/_rewrite/type/test.json");
-        T(req.responseText == "test as json");
-
-        req = CouchDB.request("GET", "/test_suite_db/_design/test/_rewrite/type/test.xml");
-        T(req.responseText == "test as xml");
-
-         req = CouchDB.request("GET", "/test_suite_db/_design/test/_rewrite/type/test");
-        T(req.responseText == "test as html");
+        xhr = CouchDB.request("GET", "/test_suite_db/_design/test/_rewrite/simpleForm/complexView7/test/essai?doc=true");
+        T(xhr.status == 200, "with query params");
+        var result = JSON.parse(xhr.responseText);
+        T(typeof(result.rows[0].doc) === "object");
         
         // test path relative to server
         designDoc.rewrites.push({
@@ -437,7 +425,16 @@ couchTests.rewrite = function(debug) {
               T(result.uuids.length == 1);
               var first = result.uuids[0];
         });
-
   });
-  
+
+  // test invalid rewrites
+  // string
+  var ddoc = {
+    _id: "_design/invalid",
+    rewrites: "[{\"from\":\"foo\",\"to\":\"bar\"}]"
+  }
+  db.save(ddoc);
+  var res = CouchDB.request("GET", "/test_suite_db/_design/invalid/_rewrite/foo");
+  TEquals(400, res.status, "should return 400");
+
 }

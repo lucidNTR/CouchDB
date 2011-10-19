@@ -19,9 +19,6 @@
     handler
 }).
 
-default_config() ->
-    test_util:build_file("etc/couchdb/default_dev.ini").
-
 test_db_name() ->
     <<"couch_test_invalid_view_seq">>.
 
@@ -42,7 +39,7 @@ main(_) ->
 %%       a huge and ugly but harmless stack trace is sent to stderr
 %%
 test() ->
-    couch_server_sup:start_link([default_config()]),
+    couch_server_sup:start_link(test_util:config_files()),
     timer:sleep(1000),
     delete_db(),
     create_db(),
@@ -54,8 +51,7 @@ test() ->
     backup_db_file(),
 
     put(addr, couch_config:get("httpd", "bind_address", "127.0.0.1")),
-    put(port, couch_config:get("httpd", "port", "5984")),
-    application:start(inets),
+    put(port, integer_to_list(mochiweb_socket_server:get(couch_httpd, port))),
 
     create_new_doc(),
     query_view_before_restore_backup(),
@@ -136,13 +132,10 @@ db_url() ->
     binary_to_list(test_db_name()).
 
 query_view_before_restore_backup() ->
-    {ok, {{_, Code, _}, _Headers, Body}} = http:request(
-        get,
-        {db_url() ++ "/_design/foo/_view/bar", []},
-        [],
-        [{sync, true}]),
+    {ok, Code, _Headers, Body} = test_util:request(
+        db_url() ++ "/_design/foo/_view/bar", [], get),
     etap:is(Code, 200, "Got view response before restoring backup."),
-    ViewJson = couch_util:json_decode(Body),
+    ViewJson = ejson:decode(Body),
     Rows = couch_util:get_nested_json_value(ViewJson, [<<"rows">>]),
     HasDoc1 = has_doc("doc1", Rows),
     HasDoc2 = has_doc("doc2", Rows),
@@ -168,18 +161,16 @@ restore_backup_db_file() ->
         binary_to_list(test_db_name()) ++ ".couch"),
     ok = file:delete(DbFile),
     ok = file:rename(DbFile ++ ".backup", DbFile),
-    couch_server_sup:start_link([default_config()]),
+    couch_server_sup:start_link(test_util:config_files()),
     timer:sleep(1000),
+    put(port, integer_to_list(mochiweb_socket_server:get(couch_httpd, port))),
     ok.
 
 query_view_after_restore_backup() ->
-    {ok, {{_, Code, _}, _Headers, Body}} = http:request(
-        get,
-        {db_url() ++ "/_design/foo/_view/bar", []},
-        [],
-        [{sync, true}]),
+    {ok, Code, _Headers, Body} = test_util:request(
+        db_url() ++ "/_design/foo/_view/bar", [], get),
     etap:is(Code, 200, "Got view response after restoring backup."),
-    ViewJson = couch_util:json_decode(Body),
+    ViewJson = ejson:decode(Body),
     Rows = couch_util:get_nested_json_value(ViewJson, [<<"rows">>]),
     HasDoc1 = has_doc("doc1", Rows),
     HasDoc2 = has_doc("doc2", Rows),

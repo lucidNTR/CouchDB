@@ -61,12 +61,18 @@ json_req_obj(#httpd{mochi_req=Req,
                req_body=ReqBody
             }, Db, DocId) ->
     Body = case ReqBody of
-        undefined -> Req:recv_body();
+        undefined ->
+            MaxSize = list_to_integer(
+                couch_config:get("couchdb", "max_document_size", "4294967296")),
+            Req:recv_body(MaxSize);
         Else -> Else
     end,
     ParsedForm = case Req:get_primary_header_value("content-type") of
         "application/x-www-form-urlencoded" ++ _ ->
-            mochiweb_util:parse_qs(Body);
+            case Body of
+            undefined -> [];
+            _ -> mochiweb_util:parse_qs(Body)
+            end;
         _ ->
             []
     end,
@@ -105,11 +111,11 @@ json_query_keys({Json}) ->
 json_query_keys([], Acc) ->
     {lists:reverse(Acc)};
 json_query_keys([{<<"startkey">>, Value} | Rest], Acc) ->
-    json_query_keys(Rest, [{<<"startkey">>, couch_util:json_decode(Value)}|Acc]);
+    json_query_keys(Rest, [{<<"startkey">>, ?JSON_DECODE(Value)}|Acc]);
 json_query_keys([{<<"endkey">>, Value} | Rest], Acc) ->
-    json_query_keys(Rest, [{<<"endkey">>, couch_util:json_decode(Value)}|Acc]);
+    json_query_keys(Rest, [{<<"endkey">>, ?JSON_DECODE(Value)}|Acc]);
 json_query_keys([{<<"key">>, Value} | Rest], Acc) ->
-    json_query_keys(Rest, [{<<"key">>, couch_util:json_decode(Value)}|Acc]);
+    json_query_keys(Rest, [{<<"key">>, ?JSON_DECODE(Value)}|Acc]);
 json_query_keys([Term | Rest], Acc) ->
     json_query_keys(Rest, [Term|Acc]).
 

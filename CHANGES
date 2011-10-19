@@ -1,10 +1,183 @@
 Apache CouchDB CHANGES
 ======================
 
-Version 1.1.0
+Version 1.2.0
 -------------
 
 This version has not been released yet.
+
+Build System:
+
+ * cURL is no longer required to build CouchDB as it is only
+   used by the command line JS test runner. If cURL is available
+   when building CouchJS you can enable the HTTP bindings by
+   passing -H on the command line.
+
+HTTP Interface:
+
+ * Added a native JSON parser.
+ * The _active_tasks API now offers more granular fields. Each
+   task type is now able to expose different properties.
+
+Replicator:
+
+ * A new replicator implementation. It offers more performance and
+   configuration options.
+ * Passing non-string values to query_params is now a 400 bad
+   request. This is to reduce the surprise that all parameters
+   are converted to strings internally.
+ * Added optional field `since_seq` to replication objects/documents.
+   It allows to bootstrap a replication from a specific source sequence
+   number.
+ * Simpler replication cancelation. In addition to the current method,
+   replications can now be canceled by specifying the replication ID
+   instead of the original replication object/document.
+
+Storage System:
+
+ * Added optional database and view index file compression (using Google's
+   snappy or zlib's deflate).
+ * Several performance improvements, most notably regarding database writes
+   and view indexing.
+ * Computation of the size of the latest MVCC snapshot data and all its
+   supporting metadata, both for database and view index files. This
+   information is exposed as the `data_size` attribute in the database and
+   view group information URIs.
+ * The size of the buffers used for database and view compaction is now
+   configurable.
+ * Added support for automatic database and view compaction. This feature
+   is disabled by default, but it can be enabled via the .ini configuration.
+
+OAuth:
+
+ * Updated bundled erlang_oauth library to the latest version.
+
+Futon:
+
+ * The `Status` screen (active tasks) now displays two new task status
+   fields: `Started on` and `Updated on`.
+
+Version 1.1.1
+-------------
+
+This version has not been released yet.
+
+* ETags for views include current sequence if include_docs=true.
+* JSONP responses now send "text/javascript" for Content-Type.
+
+Version 1.1.0
+-------------
+
+All CHANGES for 1.0.2 and 1.0.3 also apply to 1.1.0.
+
+HTTP Interface:
+
+ * Native SSL support.
+ * Added support for HTTP range requests for attachments.
+ * Added built-in filters for `_changes`: `_doc_ids` and `_design`.
+ * Added configuration option for TCP_NODELAY aka "Nagle".
+ * Allow POSTing arguments to `_changes`.
+ * Allow `keys` parameter for GET requests to views.
+ * Allow wildcards in vhosts definitions.
+ * More granular ETag support for views.
+ * More flexible URL rewriter.
+ * Added support for recognizing "Q values" and media parameters in
+   HTTP Accept headers.
+ * Validate doc ids that come from a PUT to a URL.
+
+Externals:
+
+ * Added OS Process module to manage daemons outside of CouchDB.
+ * Added HTTP Proxy handler for more scalable externals.
+
+Replicator:
+
+ * Added `_replicator` database to manage replications.
+ * Fixed issues when an endpoint is a remote database accessible via SSL.
+ * Added support for continuous by-doc-IDs replication.
+ * Fix issue where revision info was omitted when replicating attachments.
+ * Integrity of attachment replication is now verified by MD5.
+
+Storage System:
+
+ * Multiple micro-optimizations when reading data.
+
+View Server:
+
+ * Added CommonJS support to map functions.
+ * Added `stale=update_after` query option that triggers a view update after
+   returning a `stale=ok` response.
+ * Warn about empty result caused by `startkey` and `endkey` limiting.
+ * Built-in reduce function `_sum` now accepts lists of integers as input.
+ * Added view query aliases start_key, end_key, start_key_doc_id and
+   end_key_doc_id.
+
+Futon:
+
+ * Added a "change password"-feature to Futon.
+
+URL Rewriter & Vhosts:
+
+ * Fix for variable substituion
+
+Version 1.0.2
+-------------
+
+Futon:
+
+ * Make test suite work with Safari and Chrome.
+ * Fixed animated progress spinner.
+ * Fix raw view document link due to overzealous URI encoding.
+ * Spell javascript correctly in loadScript(uri).
+
+Storage System:
+
+ * Fix leaking file handles after compacting databases and views.
+ * Fix databases forgetting their validation function after compaction.
+ * Fix occasional timeout errors after successfully compacting large databases.
+ * Fix ocassional error when writing to a database that has just been compacted.
+ * Fix occasional timeout errors on systems with slow or heavily loaded IO.
+ * Fix for OOME when compactions include documents with many conflicts.
+ * Fix for missing attachment compression when MIME types included parameters.
+ * Preserve purge metadata during compaction to avoid spurious view rebuilds.
+ * Fix spurious conflicts introduced when uploading an attachment after
+   a doc has been in a conflict. See COUCHDB-902 for details.
+ * Fix for frequently edited documents in multi-master deployments being
+   duplicated in _changes and _all_docs.  See COUCHDDB-968 for details on how
+   to repair.
+ * Significantly higher read and write throughput against database and
+   view index files.
+
+Log System:
+
+ * Reduce lengthy stack traces.
+ * Allow logging of native <xml> types.
+
+HTTP Interface:
+
+ * Allow reduce=false parameter in map-only views.
+ * Fix parsing of Accept headers.
+ * Fix for multipart GET APIs when an attachment was created during a
+   local-local replication. See COUCHDB-1022 for details.
+
+Replicator:
+
+ * Updated ibrowse library to 2.1.2 fixing numerous replication issues.
+ * Make sure that the replicator respects HTTP settings defined in the config.
+ * Fix error when the ibrowse connection closes unexpectedly.
+ * Fix authenticated replication (with HTTP basic auth) of design documents
+   with attachments.
+ * Various fixes to make replication more resilient for edge-cases.
+
+View Server:
+
+ * Don't trigger view updates when requesting `_design/doc/_info`.
+ * Fix for circular references in CommonJS requires.
+ * Made isArray() function available to functions executed in the query server.
+ * Documents are now sealed before being passed to map functions.
+ * Force view compaction failure when duplicated document data exists. When
+   this error is seen in the logs users should rebuild their views from
+   scratch to fix the issue. See COUCHDB-999 for details.
 
 Version 1.0.1
 -------------

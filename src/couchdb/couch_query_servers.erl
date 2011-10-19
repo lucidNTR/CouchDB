@@ -13,16 +13,18 @@
 -module(couch_query_servers).
 -behaviour(gen_server).
 
--export([start_link/0]).
+-export([start_link/0, config_change/1]).
 
 -export([init/1, terminate/2, handle_call/3, handle_cast/2, handle_info/2,code_change/3]).
--export([start_doc_map/2, map_docs/2, stop_doc_map/1]).
+-export([start_doc_map/3, map_docs/2, map_doc_raw/2, stop_doc_map/1, raw_to_ejson/1]).
 -export([reduce/3, rereduce/3,validate_doc_update/5]).
 -export([filter_docs/5]).
+-export([filter_view/3]).
 
 -export([with_ddoc_proc/2, proc_prompt/2, ddoc_prompt/3, ddoc_proc_prompt/3, json_doc/1]).
 
-% -export([test/0]).
+% For 210-os-proc-pool.t
+-export([get_os_process/1, ret_os_process/1]).
 
 -include("couch_db.hrl").
 
@@ -47,8 +49,13 @@
 start_link() ->
     gen_server:start_link({local, couch_query_servers}, couch_query_servers, [], []).
 
-start_doc_map(Lang, Functions) ->
+start_doc_map(Lang, Functions, Lib) ->
     Proc = get_os_process(Lang),
+    case Lib of
+    {[]} -> ok;
+    Lib ->
+        true = proc_prompt(Proc, [<<"add_lib">>, Lib])
+    end,
     lists:foreach(fun(FunctionSource) ->
         true = proc_prompt(Proc, [<<"add_fun">>, FunctionSource])
     end, Functions),
@@ -75,6 +82,10 @@ map_docs(Proc, Docs) ->
         end,
         Docs),
     {ok, Results}.
+
+map_doc_raw(Proc, Doc) ->
+    Json = couch_doc:to_json_obj(Doc, []),
+    {ok, proc_prompt_raw(Proc, [<<"map_doc">>, Json])}.
 
 
 stop_doc_map(nil) ->
@@ -190,7 +201,7 @@ sum_terms(_, _) ->
 
 builtin_stats(reduce, [[_,First]|Rest]) when is_number(First) ->
     Stats = lists:foldl(fun([_K,V], {S,C,Mi,Ma,Sq}) when is_number(V) ->
-        {S+V, C+1, erlang:min(Mi,V), erlang:max(Ma,V), Sq+(V*V)};
+        {S+V, C+1, lists:min([Mi, V]), lists:max([Ma, V]), Sq+(V*V)};
     (_, _) ->
         throw({invalid_value,
             <<"builtin _stats function requires map values to be numbers">>})
@@ -202,7 +213,7 @@ builtin_stats(rereduce, [[_,First]|Rest]) ->
     {[{sum,Sum0}, {count,Cnt0}, {min,Min0}, {max,Max0}, {sumsqr,Sqr0}]} = First,
     Stats = lists:foldl(fun([_K,Red], {S,C,Mi,Ma,Sq}) ->
         {[{sum,Sum}, {count,Cnt}, {min,Min}, {max,Max}, {sumsqr,Sqr}]} = Red,
-        {Sum+S, Cnt+C, erlang:min(Min,Mi), erlang:max(Max,Ma), Sqr+Sq}
+        {Sum+S, Cnt+C, lists:min([Min, Mi]), lists:max([Max, Ma]), Sqr+Sq}
     end, {Sum0,Cnt0,Min0,Max0,Sqr0}, Rest),
     {Sum, Cnt, Min, Max, Sqr} = Stats,
     {[{sum,Sum}, {count,Cnt}, {min,Min}, {max,Max}, {sumsqr,Sqr}]}.
@@ -224,6 +235,11 @@ json_doc(nil) -> null;
 json_doc(Doc) ->
     couch_doc:to_json_obj(Doc, [revs]).
 
+filter_view(DDoc, VName, Docs) ->
+    JsonDocs = [couch_doc:to_json_obj(Doc, [revs]) || Doc <- Docs],
+    [true, Passes] = ddoc_prompt(DDoc, [<<"views">>, VName, <<"map">>], [JsonDocs]),
+    {ok, Passes}.
+
 filter_docs(Req, Db, DDoc, FName, Docs) ->
     JsonReq = case Req of
     {json_req, JsonObj} ->
@@ -232,7 +248,8 @@ filter_docs(Req, Db, DDoc, FName, Docs) ->
         couch_httpd_external:json_req_obj(HttpReq, Db)
     end,
     JsonDocs = [couch_doc:to_json_obj(Doc, [revs]) || Doc <- Docs],
-    [true, Passes] = ddoc_prompt(DDoc, [<<"filters">>, FName], [JsonDocs, JsonReq]),
+    [true, Passes] = ddoc_prompt(DDoc, [<<"filters">>, FName],
+        [JsonDocs, JsonReq]),
     {ok, Passes}.
 
 ddoc_proc_prompt({Proc, DDocId}, FunPath, Args) ->
@@ -253,26 +270,9 @@ with_ddoc_proc(#doc{id=DDocId,revs={Start, [DiskRev|_]}}=DDoc, Fun) ->
     end.
 
 init([]) ->
-    % read config and register for configuration changes
-
-    % just stop if one of the config settings change. couch_server_sup
-    % will restart us and then we will pick up the new settings.
-
-    ok = couch_config:register(
-        fun("query_servers" ++ _, _) ->
-            supervisor:terminate_child(couch_secondary_services, query_servers),
-            supervisor:restart_child(couch_secondary_services, query_servers)
-        end),
-    ok = couch_config:register(
-        fun("native_query_servers" ++ _, _) ->
-            supervisor:terminate_child(couch_secondary_services, query_servers),
-            [supervisor:restart_child(couch_secondary_services, query_servers)]
-        end),
-    ok = couch_config:register(
-        fun("query_server_config" ++ _, _) ->
-            supervisor:terminate_child(couch_secondary_services, query_servers),
-            supervisor:restart_child(couch_secondary_services, query_servers)
-        end),
+    % register async to avoid deadlock on restart_child
+    Self = self(),
+    spawn(couch_config, register, [fun ?MODULE:config_change/1, Self]),
 
     Langs = ets:new(couch_query_server_langs, [set, private]),
     LangLimits = ets:new(couch_query_server_lang_limits, [set, private]),
@@ -314,7 +314,8 @@ terminate(_Reason, #qserver{pid_procs=PidProcs}) ->
     [couch_util:shutdown_sync(P) || {P,_} <- ets:tab2list(PidProcs)],
     ok.
 
-handle_call({get_proc, #doc{body={Props}}=DDoc, DDocKey}, From, Server) ->
+handle_call({get_proc, DDoc1, DDocKey}, From, Server) ->
+    #doc{body = {Props}} = DDoc = couch_doc:with_ejson_body(DDoc1),
     Lang = couch_util:get_value(<<"language">>, Props, <<"javascript">>),
     case lang_proc(Lang, Server, fun(Procs) ->
             % find a proc in the set that has the DDoc
@@ -338,8 +339,7 @@ handle_call({get_proc, Lang}, From, Server) ->
     Error ->
         {reply, Error, Server}
     end;
-handle_call({unlink_proc, Pid}, _From, #qserver{pid_procs=PidProcs}=Server) ->
-    rem_value(PidProcs, Pid),
+handle_call({unlink_proc, Pid}, _From, Server) ->
     unlink(Pid),
     {reply, ok, Server};
 handle_call({ret_proc, Proc}, _From, #qserver{
@@ -347,15 +347,22 @@ handle_call({ret_proc, Proc}, _From, #qserver{
         lang_procs=LangProcs}=Server) ->
     % Along with max process limit, here we should check
     % if we're over the limit and discard when we are.
-    add_value(PidProcs, Proc#proc.pid, Proc),
-    add_to_list(LangProcs, Proc#proc.lang, Proc),
-    link(Proc#proc.pid),
+    case is_process_alive(Proc#proc.pid) of
+        true ->
+            add_value(PidProcs, Proc#proc.pid, Proc),
+            add_to_list(LangProcs, Proc#proc.lang, Proc),
+            link(Proc#proc.pid);
+        false ->
+            ok
+    end,
     {reply, true, service_waitlist(Server)}.
 
 handle_cast(_Whatever, Server) ->
     {noreply, Server}.
 
-handle_info({'EXIT', Pid, Status}, #qserver{
+handle_info({'EXIT', _, _}, Server) ->
+    {noreply, Server};
+handle_info({'DOWN', _, process, Pid, Status}, #qserver{
         pid_procs=PidProcs,
         lang_procs=LangProcs,
         lang_limits=LangLimits}=Server) ->
@@ -381,6 +388,16 @@ handle_info({'EXIT', Pid, Status}, #qserver{
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+config_change("query_servers") ->
+    supervisor:terminate_child(couch_secondary_services, query_servers),
+    supervisor:restart_child(couch_secondary_services, query_servers);
+config_change("native_query_servers") ->
+    supervisor:terminate_child(couch_secondary_services, query_servers),
+    supervisor:restart_child(couch_secondary_services, query_servers);
+config_change("query_server_config") ->
+    supervisor:terminate_child(couch_secondary_services, query_servers),
+    supervisor:restart_child(couch_secondary_services, query_servers).
 
 % Private API
 
@@ -456,6 +473,7 @@ new_process(Langs, LangLimits, Lang) ->
         case ets:lookup(Langs, Lang) of
         [{Lang, Mod, Func, Arg}] ->
             {ok, Pid} = apply(Mod, Func, Arg),
+            erlang:monitor(process, Pid),
             true = ets:insert(LangLimits, {Lang, Lim, Current+1}),
             {ok, #proc{lang=Lang,
                        pid=Pid,
@@ -488,8 +506,20 @@ proc_with_ddoc(DDoc, DDocKey, LangProcs) ->
     end.
 
 proc_prompt(Proc, Args) ->
-    {Mod, Func} = Proc#proc.prompt_fun,
+     case proc_prompt_raw(Proc, Args) of
+     {json, Json} ->
+         ?JSON_DECODE(Json);
+     EJson ->
+         EJson
+     end.
+
+proc_prompt_raw(#proc{prompt_fun = {Mod, Func}} = Proc, Args) ->
     apply(Mod, Func, [Proc#proc.pid, Args]).
+
+raw_to_ejson({json, Json}) ->
+    ?JSON_DECODE(Json);
+raw_to_ejson(EJson) ->
+    EJson.
 
 proc_stop(Proc) ->
     {Mod, Func} = Proc#proc.stop_fun,

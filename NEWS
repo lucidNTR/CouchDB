@@ -7,10 +7,85 @@ For details about backwards incompatible changes, see:
 
 Each release section notes when backwards incompatible changes have been made.
 
-Version 1.1.0
+Version 1.2.0
 -------------
 
 This version has not been released yet.
+
+ * Updated bundled erlang_oauth library to the latest version.
+ * cURL is no longer required to build CouchDB as it is only
+   required by the command line JS test runner.
+ * Added a native JSON parser.
+ * Optional file compression (database and view index files).
+ * Several performance improvements, especially regarding database
+   writes and view indexing.
+ * Added a `data_size` property to database and view group
+   information URIs.
+ * Added support for automatic compaction. This feature is disabled
+   by default, but it can be enabled via the .ini configuration.
+ * A new replicator implementation that offers more performance
+   and configuration options.
+ * Added optional field `since_seq` to replication ojects/documents.
+ * Simpler replication cancelation.
+ * The _active_tasks API now exposes more granular fields for each
+   task type.
+ * Futon's `Status` screen (active tasks) now displays two new task
+   status fields: `Started on` and `Updated on`.
+
+Version 1.1.1
+-------------
+
+This version has not been released yet.
+
+* ETags for views include current sequence if include_docs=true.
+* JSONP responses now send "text/javascript" for Content-Type.
+
+Version 1.1.0
+-------------
+
+All NEWS for 1.0.2 also apply to 1.1.0.
+
+This release contains backwards incompatible changes.
+
+ * Native SSL support.
+ * Added support for HTTP range requests for attachments.
+ * Added built-in filters for `_changes`: `_doc_ids` and `_design`.
+ * Added configuration option for TCP_NODELAY aka "Nagle".
+ * Allow wildcards in vhosts definitions.
+ * More granular ETag support for views.
+ * More flexible URL rewriter.
+ * Added OS Process module to manage daemons outside of CouchDB.
+ * Added HTTP Proxy handler for more scalable externals.
+ * Added `_replicator` database to manage replications.
+ * Multiple micro-optimizations when reading data.
+ * Added CommonJS support to map functions.
+ * Added `stale=update_after` query option that triggers a view update after
+   returning a `stale=ok` response.
+ * More explicit error messages when it's not possible to access a file due
+   to lack of permissions.
+ * Added a "change password"-feature to Futon.
+
+Version 1.0.2
+-------------
+
+ * Make test suite work with Safari and Chrome.
+ * Fix leaking file handles after compacting databases and views.
+ * Fix databases forgetting their validation function after compaction.
+ * Fix occasional timeout errors.
+ * Reduce lengthy stack traces.
+ * Allow logging of native <xml> types.
+ * Updated ibrowse library to 2.1.2 fixing numerous replication issues.
+ * Fix authenticated replication of design documents with attachments.
+ * Fix multipart GET APIs by always sending attachments in compressed
+   form when the source attachment is compressed on disk. Fixes a possible
+   edge case when an attachment underwent local-local replication.
+ * Various fixes to make replicated more resilient for edge-cases.
+ * Don't trigger a view update when requesting `_design/doc/_info`.
+ * Fix for circular references in CommonJS requires.
+ * Fix for frequently edited documents in multi-master deployments being
+   duplicated in _changes and _all_docs.
+ * Fix spurious conflict generation during attachment uploads.
+ * Fix for various bugs in Futon.
 
 Version 1.0.1
 -------------
@@ -149,7 +224,7 @@ Version 0.10.1
 Version 0.10.0
 --------------
 
-This release contains backwards incompatible changes, please see above for help.
+This release contains backwards incompatible changes
 
  * General performance improvements.
  * View index generation speedups.
@@ -181,7 +256,7 @@ Version 0.9.1
 Version 0.9.0
 -------------
 
-This release contains backwards incompatible changes, please see above for help.
+This release contains backwards incompatible changes.
 
  * Modular configuration.
  * Performance enhancements for document and view access.
@@ -205,7 +280,7 @@ Version 0.8.1-incubating
 Version 0.8.0-incubating
 ------------------------
 
-This release contains backwards incompatible changes, please see above for help.
+This release contains backwards incompatible changes.
 
  * Changed core licensing to the Apache Software License 2.0.
  * Refactoring of the core view and storage engines.

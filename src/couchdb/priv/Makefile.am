@@ -16,22 +16,29 @@ couchprivlibdir = $(couchlibdir)/priv/lib
 
 EXTRA_DIST = \
 	spawnkillable/couchspawnkillable.sh \
-	stat_descriptions.cfg.in
+	stat_descriptions.cfg.in \
+	couch_ejson_compare/erl_nif_compat.h \
+	couch_js/sm170.c \
+	couch_js/sm180.c \
+	couch_js/sm185.c
 
 CLEANFILES = stat_descriptions.cfg
 
-ICU_LOCAL_FLAGS = $(ICU_LOCAL_CFLAGS) $(ICU_LOCAL_LDFLAGS)
-if WINDOWS
-ICU_LOCAL_LIBS=-licuuc -licudt -licuin
-else
-ICU_LOCAL_LIBS=-licuuc -licudata -licui18n
-endif
-
 couchprivlib_LTLIBRARIES = couch_icu_driver.la
+if USE_EJSON_COMPARE_NIF
+couchprivlib_LTLIBRARIES += couch_ejson_compare.la
+couch_ejson_compare_la_SOURCES = couch_ejson_compare/couch_ejson_compare.c
+couch_ejson_compare_la_CFLAGS = -D_BSD_SOURCE $(ICU_CFLAGS) $(ERLANG_FLAGS)
+couch_ejson_compare_la_LDFLAGS = -module -avoid-version
+couch_ejson_compare_la_LIBADD = $(ICU_LIBS)
+if WINDOWS
+couch_ejson_compare_la_LDFLAGS += -no-undefined
+endif
+endif
 couch_icu_driver_la_SOURCES = icu_driver/couch_icu_driver.c
-couch_icu_driver_la_LDFLAGS = -module -avoid-version $(ICU_LOCAL_FLAGS)
-couch_icu_driver_la_CFLAGS = $(ICU_LOCAL_FLAGS)
-couch_icu_driver_la_LIBADD = $(ICU_LOCAL_LIBS)
+couch_icu_driver_la_LDFLAGS = -module -avoid-version
+couch_icu_driver_la_CFLAGS = $(ICU_CFLAGS) $(ERLANG_FLAGS)
+couch_icu_driver_la_LIBADD = $(ICU_LIBS)
 
 if WINDOWS
 couch_icu_driver_la_LDFLAGS += -no-undefined
@@ -42,13 +49,14 @@ COUCHJS_SRCS = \
 	couch_js/http.h \
 	couch_js/main.c \
 	couch_js/utf8.c \
-	couch_js/utf8.h
+	couch_js/utf8.h \
+	couch_js/util.h \
+	couch_js/util.c
 
 locallibbin_PROGRAMS = couchjs
 couchjs_SOURCES = $(COUCHJS_SRCS)
-couchjs_LDFLAGS = $(CURL_LDFLAGS)
-couchjs_CFLAGS = -D_BSD_SOURCE $(CURL_CFLAGS)
-couchjs_LDADD = $(CURL_LDFLAGS) @JSLIB@
+couchjs_CFLAGS = -g -Wall -Werror -D_BSD_SOURCE $(CURL_CFLAGS) $(JS_CFLAGS)
+couchjs_LDADD = $(CURL_LIBS) $(JS_LIBS)
 
 couchpriv_DATA = stat_descriptions.cfg
 couchpriv_PROGRAMS = couchspawnkillable
@@ -78,10 +86,15 @@ install-data-hook:
 	    cd "$(DESTDIR)$(couchprivlibdir)" && \
 	        $(LN_S) couch_icu_driver couch_icu_driver.so; \
 	fi
+	if test -f "$(DESTDIR)$(couchprivlibdir)/couch_ejson_compare_nif"; then \
+	    rm -f "$(DESTDIR)$(couchprivlibdir)/couch_ejson_compare_nif.so"; \
+	    cd "$(DESTDIR)$(couchprivlibdir)" && \
+	        $(LN_S) couch_ejson_compare_nif couch_ejson_compare_nif.so; \
+	fi
 if WINDOWS
-	$(INSTALL) $(ICU_LOCAL_BIN)/icuuc42.dll $(bindir)
-	$(INSTALL) $(ICU_LOCAL_BIN)/icudt42.dll $(bindir)
-	$(INSTALL) $(ICU_LOCAL_BIN)/icuin42.dll $(bindir)
+	$(INSTALL) $(ICU_BIN)/icuuc44.dll $(bindir)
+	$(INSTALL) $(ICU_BIN)/icudt44.dll $(bindir)
+	$(INSTALL) $(ICU_BIN)/icuin44.dll $(bindir)
 	$(INSTALL) $(JS_LIB_BINARY) $(bindir)
 	$(INSTALL) .libs/couchspawnkillable.exe \
 		"$(DESTDIR)$(couchprivdir)/couchspawnkillable.exe"

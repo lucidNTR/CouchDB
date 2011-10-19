@@ -11,6 +11,7 @@
 // the License.
 
 var sandbox = null;
+var filter_sandbox = null;
 
 function init_sandbox() {
   try {
@@ -26,11 +27,28 @@ function init_sandbox() {
     sandbox.start = Render.start;
     sandbox.send = Render.send;
     sandbox.getRow = Render.getRow;
+    sandbox.isArray = isArray;
   } catch (e) {
-    log(e.toSource());
+    //log(e.toSource());
   }
 };
 init_sandbox();
+
+function init_filter_sandbox() {
+  try {
+    filter_sandbox = evalcx('');
+    for (var p in sandbox) {
+      if (sandbox.hasOwnProperty(p)) {
+        filter_sandbox[p] = sandbox[p];
+      }
+    }
+    filter_sandbox.emit = Filter.emit;
+  } catch(e) {
+    log(e.toSource());
+  }
+};
+
+init_filter_sandbox();
 
 // Commands are in the form of json arrays:
 // ["commandname",..optional args...]\n
@@ -42,6 +60,7 @@ var DDoc = (function() {
     "lists"     : Render.list,
     "shows"    : Render.show,
     "filters"   : Filter.filter,
+    "views"     : Filter.filter_view, 
     "updates"  : Render.update,
     "validate_doc_update" : Validate.validate
   };
@@ -72,14 +91,19 @@ var DDoc = (function() {
           var point = ddoc;
           for (var i=0; i < funPath.length; i++) {
             if (i+1 == funPath.length) {
-              fun = point[funPath[i]]
+              var fun = point[funPath[i]];
+              if (!fun) {
+                throw(["error","not_found",
+                       "missing " + funPath[0] + " function " + funPath[i] +
+                       " on design doc " + ddocId]);
+              }
               if (typeof fun != "function") {
                 fun = Couch.compileFunction(fun, ddoc);
                 // cache the compiled fun on the ddoc
-                point[funPath[i]] = fun
+                point[funPath[i]] = fun;
               };
             } else {
-              point = point[funPath[i]]              
+              point = point[funPath[i]];
             }
           };
 
@@ -100,6 +124,7 @@ var Loop = function() {
     // "view"    : Views.handler,
     "reset"    : State.reset,
     "add_fun"  : State.addFun,
+    "add_lib"  : State.addLib,
     "map_doc"  : Views.mapDoc,
     "reduce"   : Views.reduce,
     "rereduce" : Views.rereduce
@@ -120,7 +145,7 @@ var Loop = function() {
     }
   };
   while (line = readline()) {
-    cmd = eval('('+line+')');
+    cmd = JSON.parse(line);
     State.line_length = line.length;
     try {
       cmdkey = cmd.shift();

@@ -68,6 +68,10 @@ function $$(node) {
         callback({name: "Please enter a name."});
         return false;
       };
+      return validatePassword(data, callback);
+    };
+
+    function validatePassword(data, callback) {
       if (!data.password || data.password.length == 0) {
         callback({password: "Please enter a password."});
         return false;
@@ -129,11 +133,61 @@ function $$(node) {
       return false;
     };
 
+    function changePassword () {
+      $.showDialog("dialog/_change_password.html", {
+        submit: function(data, callback) {
+          if (validatePassword(data, callback)) {
+            if (data.password != data.verify_password) {
+              callback({verify_password: "Passwords don't match."});
+              return false;
+            }
+          } else {
+            return false;
+          }
+          $.couch.session({success: function (resp) {
+            if (resp.userCtx.roles.indexOf("_admin") > -1) {
+              $.couch.config({
+                success : function () {
+                  doLogin(resp.userCtx.name, data.password, function(errors) {
+                    if(!$.isEmptyObject(errors)) {
+                      callback(errors);
+                      return;
+                    } else {
+                      location.reload();
+                    }
+                  });
+                }
+              }, "admins", resp.userCtx.name, data.password);
+            } else {
+              $.couch.db(resp.info.authentication_db).openDoc("org.couchdb.user:"+resp.userCtx.name, {
+                success: function (user) {
+                    $.couch.db(resp.info.authentication_db).saveDoc($.couch.prepareUserDoc(user, data.password), {
+                      success: function() {
+                          doLogin(user.name, data.password, function(errors) {
+                              if(!$.isEmptyObject(errors)) {
+                                callback(errors);
+                                return;
+                              } else {
+                                location.reload();
+                              }
+                            });
+                          }
+                      });
+                  }
+              });
+            }
+          }});
+        }
+      });
+      return false;
+    };
+
     this.setupSidebar = function() {
       $("#userCtx .login").click(login);
       $("#userCtx .logout").click(logout);
       $("#userCtx .signup").click(signup);
       $("#userCtx .createadmin").click(createAdmin);
+      $("#userCtx .changepass").click(changePassword);
     };
     
     this.sidebar = function() {
@@ -146,6 +200,7 @@ function $$(node) {
           if (userCtx.name) {
             $("#userCtx .name").text(userCtx.name).attr({href : $.couch.urlPrefix + "/_utils/document.html?"+encodeURIComponent(r.info.authentication_db)+"/org.couchdb.user%3A"+encodeURIComponent(userCtx.name)});
             if (userCtx.roles.indexOf("_admin") != -1) {
+              $("#userCtx .loggedin").show();
               $("#userCtx .loggedinadmin").show();
             } else {
               $("#userCtx .loggedin").show();
@@ -215,9 +270,10 @@ function $$(node) {
       recentDbs.sort();
       $.each(recentDbs, function(idx, name) {
         if (name) {
+          name = encodeURIComponent(name);
           $("#dbs").append("<li>" +
             "<button class='remove' title='Remove from list' value='" + name + "'></button>" +
-            "<a href='database.html?" + encodeURIComponent(name) + "' title='" + name + "'>" + name +
+            "<a href='database.html?" + name + "' title='" + name + "'>" + name +
             "</a></li>");
         }
       });
@@ -334,6 +390,14 @@ function $$(node) {
       return callback(decl);
     }
 
+    function windowName() {
+      try {
+        return JSON.parse(window.name || "{}");
+      } catch (e) {
+        return {};
+      }
+    }
+
     // add suffix to cookie names to be able to separate between ports
     var cookiePrefix = location.port + "_";
 
@@ -366,15 +430,15 @@ function $$(node) {
 
       "window": {
         get: function(name) {
-          return JSON.parse(window.name || "{}")[name];
+          return windowName()[name];
         },
         set: function(name, value) {
-          var obj = JSON.parse(window.name || "{}");
+          var obj = windowName();
           obj[name] = value || null;
           window.name = JSON.stringify(obj);
         },
         del: function(name) {
-          var obj = JSON.parse(window.name || "{}");
+          var obj = windowName();
           delete obj[name];
           window.name = JSON.stringify(obj);
         }

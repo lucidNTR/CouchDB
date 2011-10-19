@@ -81,6 +81,28 @@ couchTests.basics = function(debug) {
   // Check the database doc count
   T(db.info().doc_count == 4);
 
+  // COUCHDB-954
+  var oldRev = db.save({_id:"COUCHDB-954", a:1}).rev;
+  var newRev = db.save({_id:"COUCHDB-954", _rev:oldRev}).rev;
+
+  // test behavior of open_revs with explicit revision list
+  var result = db.open("COUCHDB-954", {open_revs:[oldRev,newRev]});
+  T(result.length == 2, "should get two revisions back");
+  T(result[0].ok);
+  T(result[1].ok);
+
+  // latest=true suppresses non-leaf revisions
+  var result = db.open("COUCHDB-954", {open_revs:[oldRev,newRev], latest:true});
+  T(result.length == 1, "should only get the child revision with latest=true");
+  T(result[0].ok._rev == newRev, "should get the child and not the parent");
+
+  // latest=true returns a child when you ask for a parent
+  var result = db.open("COUCHDB-954", {open_revs:[oldRev], latest:true});
+  T(result[0].ok._rev == newRev, "should get child when we requested parent");
+
+  // clean up after ourselves
+  db.save({_id:"COUCHDB-954", _rev:newRev, _deleted:true});
+
   // Test a simple map functions
 
   // create a map function that selects all documents whose "a" member
@@ -90,13 +112,13 @@ couchTests.basics = function(debug) {
       emit(null, doc.b);
   };
 
-  results = db.query(mapFunction);
+  var results = db.query(mapFunction);
 
   // verify only one document found and the result value (doc.b).
   T(results.total_rows == 1 && results.rows[0].value == 16);
 
   // reopen document we saved earlier
-  existingDoc = db.open(id);
+  var existingDoc = db.open(id);
 
   T(existingDoc.a==1);
 
@@ -159,8 +181,8 @@ couchTests.basics = function(debug) {
   var loc = xhr.getResponseHeader("Location");
   T(loc, "should have a Location header");
   var locs = loc.split('/');
-  T(locs[4] == resp.id);
-  T(locs[3] == "test_suite_db");
+  T(locs[locs.length-1] == resp.id);
+  T(locs[locs.length-2] == "test_suite_db");
 
   // test that that POST's with an _id aren't overriden with a UUID.
   var xhr = CouchDB.request("POST", "/test_suite_db", {
@@ -189,7 +211,7 @@ couchTests.basics = function(debug) {
   T(xhr.status == 404);
 
   // Check for invalid document members
-  bad_docs = [
+  var bad_docs = [
     ["goldfish", {"_zing": 4}],
     ["zebrafish", {"_zoom": "hello"}],
     ["mudfish", {"zane": "goldfish", "_fan": "something smells delicious"}],
@@ -246,4 +268,23 @@ couchTests.basics = function(debug) {
   result = JSON.parse(xhr.responseText);
   TEquals("bad_request", result.error);
   TEquals("You tried to DELETE a database with a ?=rev parameter. Did you mean to DELETE a document instead?", result.reason);
+
+  // On restart, a request for creating a database that already exists can
+  // not override the existing database file
+  db = new CouchDB("test_suite_foobar");
+  db.deleteDb();
+  xhr = CouchDB.request("PUT", "/" + db.name);
+  TEquals(201, xhr.status);
+
+  TEquals(true, db.save({"_id": "doc1"}).ok);
+  TEquals(true, db.ensureFullCommit().ok);
+
+  TEquals(1, db.info().doc_count);
+
+  restartServer();
+
+  xhr = CouchDB.request("PUT", "/" + db.name);
+  TEquals(412, xhr.status);
+
+  TEquals(1, db.info().doc_count);
 };

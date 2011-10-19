@@ -20,7 +20,7 @@ specific language governing permissions and limitations under the License.
     <link rel="stylesheet" href="style/layout.css?0.11.0" type="text/css">
     <script src="script/json2.js"></script>
     <script src="script/sha1.js"></script>
-    <script src="script/jquery.js?1.4.2"></script>
+    <script src="script/jquery.js?1.6.2"></script>
     <script src="script/jquery.couch.js?0.11.0"></script>
     <script src="script/jquery.dialog.js?0.11.0"></script>
     <script src="script/futon.js?0.11.0"></script>
@@ -34,7 +34,7 @@ specific language governing permissions and limitations under the License.
             this.updateSelection(location.pathname + "index.html");
           });
         }
-        var dbsPerPage = $.futon.storage.get("per_page");
+        var dbsPerPage = parseInt($.futon.storage.get("per_page"));
         if (dbsPerPage) $("#perpage").val(dbsPerPage);
         $("#perpage").change(function() {
           page.updateDatabaseListing();

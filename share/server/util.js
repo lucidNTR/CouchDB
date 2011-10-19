@@ -21,7 +21,7 @@ var resolveModule = function(names, mod, root) {
       parent : mod.parent,
       id : mod.id,
       exports : {}
-    }
+    };
   }
   // we need to traverse the path
   var n = names.shift();
@@ -31,22 +31,22 @@ var resolveModule = function(names, mod, root) {
     }
     return resolveModule(names, {
       id : mod.id.slice(0, mod.id.lastIndexOf('/')),
-      parent : mod.parent.parent.parent,
-      current : mod.parent.parent.current
+      parent : mod.parent.parent,
+      current : mod.parent.current
     });
   } else if (n == '.') {
     if (!mod.parent) {
       throw ["error", "invalid_require_path", 'Object has no parent '+JSON.stringify(mod.current)];
     }
     return resolveModule(names, {
-      parent : mod.parent.parent,
-      current : mod.parent.current,
+      parent : mod.parent,
+      current : mod.current,
       id : mod.id
     });
   } else if (root) {
     mod = {current : root};
   }
-  if (!mod.current[n]) {
+  if (mod.current[n] === undefined) {
     throw ["error", "invalid_require_path", 'Object has no property "'+n+'". '+JSON.stringify(mod.current)];
   }
   return resolveModule(names, {
@@ -63,26 +63,52 @@ var Couch = {
   },
   compileFunction : function(source, ddoc) {    
     if (!source) throw(["error","not_found","missing function"]);
+    // Some newer SpiderMonkey's appear to not like evaluating
+    // an anonymous function at global scope. Simple fix just
+    // wraps the source with parens so the function object is
+    // returned correctly.
+    source = "(" + source + ")";
+    var evaluate_function_source = function(source, evalFunction, sandbox) {
+      sandbox = sandbox || {};
+      if(typeof CoffeeScript === "undefined") {
+        return evalFunction(source, sandbox);
+      } else {
+        var coffee = CoffeeScript.compile(source, {bare: true});
+        return evalFunction(coffee, sandbox);
+      }
+    }
+
     try {
       if (sandbox) {
         if (ddoc) {
+          if (!ddoc._module_cache) {
+            ddoc._module_cache = {};
+          }
           var require = function(name, module) {
             module = module || {};
-            var newModule = resolveModule(name.split('/'), module, ddoc);
-            var s = "function (module, exports, require) { " + newModule.current + " }";
-            try {
-              var func = sandbox ? evalcx(s, sandbox) : eval(s);
-              func.apply(sandbox, [newModule, newModule.exports, function(name) {return require(name, newModule)}]);
-            } catch(e) { 
-              throw ["error","compilation_error","Module require('"+name+"') raised error "+e.toSource()]; 
+            var newModule = resolveModule(name.split('/'), module.parent, ddoc);
+            if (!ddoc._module_cache.hasOwnProperty(newModule.id)) {
+              // create empty exports object before executing the module,
+              // stops circular requires from filling the stack
+              ddoc._module_cache[newModule.id] = {};
+              var s = "function (module, exports, require) { " + newModule.current + " }";
+              try {
+                var func = sandbox ? evalcx(s, sandbox) : eval(s);
+                func.apply(sandbox, [newModule, newModule.exports, function(name) {
+                  return require(name, newModule);
+                }]);
+              } catch(e) { 
+                throw ["error","compilation_error","Module require('"+name+"') raised error "+e.toSource()]; 
+              }
+              ddoc._module_cache[newModule.id] = newModule.exports;
             }
-            return newModule.exports;
-          }
+            return ddoc._module_cache[newModule.id];
+          };
           sandbox.require = require;
         }
-        var functionObject = evalcx(source, sandbox);
+        var functionObject = evaluate_function_source(source, evalcx, sandbox);
       } else {
-        var functionObject = eval(source);
+        var functionObject = evaluate_function_source(source, eval);
       }
     } catch (err) {
       throw(["error", "compilation_error", err.toSource() + " (" + source + ")"]);
@@ -96,14 +122,19 @@ var Couch = {
   },
   recursivelySeal : function(obj) {
     // seal() is broken in current Spidermonkey
-    seal(obj);
+    try {
+      seal(obj);
+    } catch (x) {
+      // Sealing of arrays broken in some SpiderMonkey versions.
+      // https://bugzilla.mozilla.org/show_bug.cgi?id=449657
+    }
     for (var propname in obj) {
-      if (typeof doc[propname] == "object") {
-        recursivelySeal(doc[propname]);
+      if (typeof obj[propname] == "object") {
+        arguments.callee(obj[propname]);
       }
     }
   }
-}
+};
 
 // prints the object as JSON, and rescues and logs any toJSON() related errors
 function respond(obj) {
@@ -117,8 +148,14 @@ function respond(obj) {
 
 function log(message) {
   // idea: query_server_config option for log level
-  if (typeof message != "string") {
+  if (typeof message == "xml") {
+    message = message.toXMLString();
+  } else if (typeof message != "string") {
     message = Couch.toJSON(message);
   }
-  respond(["log", message]);
+  respond(["log", String(message)]);
 };
+
+function isArray(obj) {
+  return toString.call(obj) === "[object Array]";
+}

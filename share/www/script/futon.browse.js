@@ -97,7 +97,10 @@
     // Page class for browse/database.html
     CouchDatabasePage: function() {
       var urlParts = location.search.substr(1).split("/");
-      var dbName = decodeURIComponent(urlParts.shift());
+      var dbName = decodeURIComponent(urlParts.shift())
+
+      var dbNameRegExp = new RegExp("[^a-z0-9\_\$\(\)\+\/\-]", "g");
+      dbName = dbName.replace(dbNameRegExp, "");
 
       $.futon.storage.declareWithPrefix(dbName + ".", {
         desc: {},
@@ -113,18 +116,19 @@
 
       var viewName = (urlParts.length > 0) ? urlParts.join("/") : null;
       if (viewName) {
-        $.futon.storage.set("view", viewName);
+        $.futon.storage.set("view", decodeURIComponent(viewName));
       } else {
         viewName = $.futon.storage.get("view");
         if (viewName) {
           this.redirecting = true;
           location.href = "database.html?" + encodeURIComponent(dbName) +
-            "/" + viewName;
+            "/" + encodeURIComponent(viewName);
         }
       }
       var db = $.couch.db(dbName);
 
       this.dbName = dbName;
+      viewName = decodeURIComponent(viewName);
       this.viewName = viewName;
       this.viewLanguage = "javascript";
       this.db = db;
@@ -150,9 +154,13 @@
                 db.compact({success: function(resp) { callback() }});
                 break;
               case "compact_views":
-                var groupname = page.viewName.substring(8,
-                    page.viewName.indexOf("/_view"));
-                db.compactView(groupname, {success: function(resp) { callback() }});
+                var idx = page.viewName.indexOf("/_view");
+                if (idx == -1) {
+                    alert("Compact Views requires focus on a view!");
+                } else {
+                    var groupname = page.viewName.substring(8, idx);
+                    db.compactView(groupname, {success: function(resp) { callback() }});
+                }
                 break;
               case "view_cleanup":
                 db.viewCleanup({success: function(resp) { callback() }});
@@ -182,26 +190,34 @@
       }
 
       this.databaseSecurity = function() {
+        function namesAndRoles(r, key) {
+          var names = [];
+          var roles = [];
+          if (r && typeof r[key + "s"] === "object") {
+            if ($.isArray(r[key + "s"]["names"])) {
+              names = r[key + "s"]["names"];
+            }
+            if ($.isArray(r[key + "s"]["roles"])) {
+              roles = r[key + "s"]["roles"];
+            }
+          }
+          return {names : names, roles: roles};
+        };
+
         $.showDialog("dialog/_database_security.html", {
           load : function(d) {
             db.getDbProperty("_security", {
               success: function(r) {
-                ["admin", "reader"].forEach(function(key) {
-                  var names = [];
-                  var roles = [];
-
-                  if (r && typeof r[key + "s"] === "object") {
-                    if ($.isArray(r[key + "s"]["names"])) {
-                      names = r[key + "s"]["names"];
-                    }
-                    if ($.isArray(r[key + "s"]["roles"])) {
-                      roles = r[key + "s"]["roles"];
-                    }
-                  }
-
-                  $("input[name=" + key + "_names]", d).val(JSON.stringify(names));
-                  $("input[name=" + key + "_roles]", d).val(JSON.stringify(roles));
-                });
+                var admins = namesAndRoles(r, "admin")
+                  , members = namesAndRoles(r, "member");
+                if (members.names.length + members.roles.length == 0) {
+                  // backwards compatibility with readers for 1.x
+                  members = namesAndRoles(r, "reader");
+                }
+                $("input[name=admin_names]", d).val(JSON.stringify(admins.names));
+                $("input[name=admin_roles]", d).val(JSON.stringify(admins.roles));
+                $("input[name=member_names]", d).val(JSON.stringify(members.names));
+                $("input[name=member_roles]", d).val(JSON.stringify(members.roles));
               }
             });
           },
@@ -213,13 +229,13 @@
                 names: [],
                 roles: []
               },
-              readers: {
+              members: {
                 names: [],
                 roles: []
               }
             };
 
-            ["admin", "reader"].forEach(function(key) {
+            ["admin", "member"].forEach(function(key) {
               var names, roles;
 
               try {
@@ -372,7 +388,8 @@
                 var path = $.couch.encodeDocId(doc._id) + "/_view/" +
                   encodeURIComponent(viewNames[j]);
                 var option = $(document.createElement("option"))
-                  .attr("value", path).text(viewNames[j]).appendTo(optGroup);
+                  .attr("value", path).text(encodeURIComponent(viewNames[j]))
+                  .appendTo(optGroup);
                 if (path == viewName) {
                   option[0].selected = true;
                 }
@@ -408,7 +425,7 @@
               }
               var viewCode = resp.views[localViewName];
               page.viewLanguage = resp.language || "javascript";
-              $("#language").val(page.viewLanguage);
+              $("#language").val(encodeURIComponent(page.viewLanguage));
               page.updateViewEditor(viewCode.map, viewCode.reduce || "");
               $("#viewcode button.revert, #viewcode button.save").attr("disabled", "disabled");
               page.storedViewCode = viewCode;
@@ -420,7 +437,7 @@
           page.updateViewEditor(page.storedViewCode.map,
             page.storedViewCode.reduce || "");
           page.viewLanguage = page.storedViewLanguage;
-          $("#language").val(page.viewLanguage);
+          $("#language").val(encodeURIComponent(page.viewLanguage));
           $("#viewcode button.revert, #viewcode button.save").attr("disabled", "disabled");
           page.isDirty = false;
           if (callback) callback();
@@ -504,7 +521,8 @@
                     callback({
                       docid: "Cannot save to " + data.docid +
                              " because its language is \"" + doc.language +
-                             "\", not \"" + page.viewLanguage + "\"."
+                             "\", not \"" +
+                             encodeURIComponent(page.viewLanguage) + "\"."
                     });
                     return;
                   }
@@ -569,7 +587,7 @@
 
       this.updateDesignDocLink = function() {
         if (viewName && /^_design/.test(viewName)) {
-          var docId = "_design/" + decodeURIComponent(viewName.split("/")[1]);
+          var docId = "_design/" + encodeURIComponent(decodeURIComponent(viewName).split("/")[1]);
           $("#designdoc-link").attr("href", "document.html?" +
             encodeURIComponent(dbName) + "/" + $.couch.encodeDocId(docId)).text(docId);
         } else {
@@ -672,10 +690,12 @@
               key = $.futon.formatJSON(row.key, {indent: 0, linesep: ""});
             }
             if (row.id) {
-              $("<td class='key'><a href='document.html?" + encodeURIComponent(db.name) +
-                "/" + $.couch.encodeDocId(row.id) + "'><strong></strong><br>" +
-                "<span class='docid'>ID:&nbsp;" + $.futon.escape(row.id) + "</span></a></td>")
-                .find("strong").text(key).end()
+              key = key.replace(/\\"/, '"');
+              var rowlink = encodeURIComponent(db.name) +
+                "/" + $.couch.encodeDocId(row.id);
+              $("<td class='key'><a href=\"document.html?" + rowlink + "\"><strong>"
+                 + $.futon.escape(key) + "</strong><br>"
+                 + "<span class='docid'>ID:&nbsp;" + $.futon.escape(row.id) + "</span></a></td>")
                 .appendTo(tr);
             } else {
               $("<td class='key'><strong></strong></td>")
@@ -765,8 +785,7 @@
             if (page.isDirty) {
               db.query(currentMapCode, currentReduceCode, page.viewLanguage, options);
             } else {
-              var viewParts = viewName.split('/');
-
+              var viewParts = decodeURIComponent(viewName).split('/');
               if ($.futon.storage.get("stale")) {
                  options.stale = "ok";
               }
@@ -1264,8 +1283,7 @@
           return false;
         }).prependTo($("a", li));
       }
-    },
-
+    }
   });
 
   function encodeAttachment(name) {

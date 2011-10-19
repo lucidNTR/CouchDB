@@ -11,7 +11,11 @@
 ## the License.
 
 noinst_SCRIPTS = run
-noinst_DATA = test_util.beam
+noinst_DATA = test_util.beam test_web.beam
+
+noinst_PROGRAMS = test_cfg_register
+test_cfg_register_SOURCES = test_cfg_register.c
+test_cfg_register_CFLAGS = -D_BSD_SOURCE
 
 %.beam: %.erl
 	$(ERLC) $<
@@ -26,7 +30,9 @@ CLEANFILES = run *.beam
 DISTCLEANFILES = temp.*
 
 EXTRA_DIST = \
-	run.tpl \
+    run.tpl \
+    test_web.erl \
+    random_port.ini \
     001-load.t \
     002-icu-driver.t \
     010-file-basics.t \
@@ -39,6 +45,7 @@ EXTRA_DIST = \
     041-uuid-gen-seq.ini \
     041-uuid-gen-utc.ini \
     041-uuid-gen.t \
+    042-work-queue.t \
     050-stream.t \
     060-kt-merging.t \
     061-kt-missing-leaves.t \
@@ -47,6 +54,8 @@ EXTRA_DIST = \
     064-kt-counting.t \
     065-kt-stemming.t \
     070-couch-db.t \
+    072-cleanup.t \
+    073-changes.t \
     080-config-get-set.t \
     081-config-override.1.ini \
     081-config-override.2.ini \
@@ -55,10 +64,6 @@ EXTRA_DIST = \
     083-config-no-files.t \
     090-task-status.t \
     100-ref-counter.t \
-    110-replication-httpc.t \
-    111-replication-changes-feed.t \
-    112-replication-missing-revs.t \
-    113-replication-attachment-comp.t \
     120-stats-collect.t \
     121-stats-aggregates.cfg \
     121-stats-aggregates.ini \
@@ -66,4 +71,24 @@ EXTRA_DIST = \
     130-attachments-md5.t \
     140-attachment-comp.t \
     150-invalid-view-seq.t \
-    160-vhosts.t
+    160-vhosts.t \
+    170-os-daemons.es \
+    170-os-daemons.t \
+    171-os-daemons-config.es \
+    171-os-daemons-config.t \
+    172-os-daemon-errors.1.sh \
+    172-os-daemon-errors.2.sh \
+    172-os-daemon-errors.3.sh \
+    172-os-daemon-errors.4.sh \
+    172-os-daemon-errors.t \
+    173-os-daemon-cfg-register.t \
+    180-http-proxy.ini \
+    180-http-proxy.t \
+    190-json-stream-parse.t \
+    200-view-group-no-db-leaks.t \
+    201-view-group-shutdown.t \
+    210-os-proc-pool.t \
+    220-compaction-daemon.t \
+    230-httpc-pool.t \
+    240-replication-compact.t \
+    241-replication-large-atts.t

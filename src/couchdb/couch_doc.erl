@@ -18,8 +18,23 @@
 -export([validate_docid/1]).
 -export([doc_from_multi_part_stream/2]).
 -export([doc_to_multi_part_stream/5, len_doc_to_multi_part_stream/4]).
+-export([abort_multi_part_stream/1]).
+-export([to_path/1]).
+-export([mp_parse_doc/2]).
+-export([with_ejson_body/1]).
 
 -include("couch_db.hrl").
+
+-spec to_path(#doc{}) -> path().
+to_path(#doc{revs={Start, RevIds}}=Doc) ->
+    [Branch] = to_branch(Doc, lists:reverse(RevIds)),
+    {Start - length(RevIds) + 1, Branch}.
+
+-spec to_branch(#doc{}, [RevId::binary()]) -> [branch()].
+to_branch(Doc, [RevId]) ->
+    [{RevId, Doc, []}];
+to_branch(Doc, [RevId | Rest]) ->
+    [{RevId, ?REV_MISSING, to_branch(Doc, Rest)}].
 
 % helpers used by to_json_obj
 to_json_rev(0, []) ->
@@ -87,8 +102,14 @@ to_json_attachments(Atts, OutputData, DataToFollow, ShowEncInfo) ->
         fun(#att{disk_len=DiskLen, att_len=AttLen, encoding=Enc}=Att) ->
             {Att#att.name, {[
                 {<<"content_type">>, Att#att.type},
-                {<<"revpos">>, Att#att.revpos}
-                ] ++
+                {<<"revpos">>, Att#att.revpos}] ++
+                case Att#att.md5 of
+                    <<>> ->
+                        [];
+                    Md5 ->
+                        EncodedMd5 = base64:encode(Md5),
+                        [{<<"digest">>, <<"md5-",EncodedMd5/binary>>}]
+                end ++
                 if not OutputData orelse Att#att.data == stub ->
                     [{<<"length">>, DiskLen}, {<<"stub">>, true}];
                 true ->
@@ -119,7 +140,10 @@ to_json_attachments(Atts, OutputData, DataToFollow, ShowEncInfo) ->
         end, Atts),
     [{<<"_attachments">>, {AttProps}}].
 
-to_json_obj(#doc{id=Id,deleted=Del,body=Body,revs={Start, RevIds},
+to_json_obj(Doc, Options) ->
+    doc_to_json_obj(with_ejson_body(Doc), Options).
+
+doc_to_json_obj(#doc{id=Id,deleted=Del,body=Body,revs={Start, RevIds},
             meta=Meta}=Doc,Options)->
     {[{<<"_id">>, Id}]
         ++ to_json_rev(Start, RevIds)
@@ -165,6 +189,10 @@ parse_revs([Rev | Rest]) ->
 
 
 validate_docid(Id) when is_binary(Id) ->
+    case couch_util:validate_utf8(Id) of
+        false -> throw({bad_request, <<"Document id must be valid UTF-8">>});
+        true -> ok
+    end,
     case Id of
     <<"_design/", _/binary>> -> ok;
     <<"_local/", _/binary>> -> ok;
@@ -195,6 +223,12 @@ transfer_fields([{<<"_rev">>, _Rev} | Rest], Doc) ->
 
 transfer_fields([{<<"_attachments">>, {JsonBins}} | Rest], Doc) ->
     Atts = lists:map(fun({Name, {BinProps}}) ->
+        Md5 = case couch_util:get_value(<<"digest">>, BinProps) of
+            <<"md5-",EncodedMd5/binary>> ->
+                base64:decode(EncodedMd5);
+            _ ->
+               <<>>
+        end,
         case couch_util:get_value(<<"stub">>, BinProps) of
         true ->
             Type = couch_util:get_value(<<"content_type">>, BinProps),
@@ -202,7 +236,7 @@ transfer_fields([{<<"_attachments">>, {JsonBins}} | Rest], Doc) ->
             DiskLen = couch_util:get_value(<<"length">>, BinProps),
             {Enc, EncLen} = att_encoding_info(BinProps),
             #att{name=Name, data=stub, type=Type, att_len=EncLen,
-                disk_len=DiskLen, encoding=Enc, revpos=RevPos};
+                disk_len=DiskLen, encoding=Enc, revpos=RevPos, md5=Md5};
         _ ->
             Type = couch_util:get_value(<<"content_type">>, BinProps,
                     ?DEFAULT_ATTACHMENT_CONTENT_TYPE),
@@ -212,7 +246,7 @@ transfer_fields([{<<"_attachments">>, {JsonBins}} | Rest], Doc) ->
                 DiskLen = couch_util:get_value(<<"length">>, BinProps),
                 {Enc, EncLen} = att_encoding_info(BinProps),
                 #att{name=Name, data=follows, type=Type, encoding=Enc,
-                    att_len=EncLen, disk_len=DiskLen, revpos=RevPos};
+                    att_len=EncLen, disk_len=DiskLen, revpos=RevPos, md5=Md5};
             _ ->
                 Value = couch_util:get_value(<<"data">>, BinProps),
                 Bin = base64:decode(Value),
@@ -252,6 +286,17 @@ transfer_fields([{<<"_conflicts">>, _} | Rest], Doc) ->
 transfer_fields([{<<"_deleted_conflicts">>, _} | Rest], Doc) ->
     transfer_fields(Rest, Doc);
 
+% special fields for replication documents
+transfer_fields([{<<"_replication_state">>, _} = Field | Rest],
+    #doc{body=Fields} = Doc) ->
+    transfer_fields(Rest, Doc#doc{body=[Field|Fields]});
+transfer_fields([{<<"_replication_state_time">>, _} = Field | Rest],
+    #doc{body=Fields} = Doc) ->
+    transfer_fields(Rest, Doc#doc{body=[Field|Fields]});
+transfer_fields([{<<"_replication_id">>, _} = Field | Rest],
+    #doc{body=Fields} = Doc) ->
+    transfer_fields(Rest, Doc#doc{body=[Field|Fields]});
+
 % unknown special field
 transfer_fields([{<<"_",Name/binary>>, _} | _], _) ->
     throw({doc_validation,
@@ -274,16 +319,30 @@ to_doc_info(FullDocInfo) ->
     {DocInfo, _Path} = to_doc_info_path(FullDocInfo),
     DocInfo.
 
-max_seq([], Max) ->
-    Max;
-max_seq([#rev_info{seq=Seq}|Rest], Max) ->
-    max_seq(Rest, if Max > Seq -> Max; true -> Seq end).
+max_seq(Tree, UpdateSeq) ->
+    FoldFun = fun({_Pos, _Key}, Value, _Type, MaxOldSeq) ->
+        case Value of
+            {_Deleted, _DiskPos, OldTreeSeq} ->
+                % Older versions didn't track data sizes.
+                erlang:max(MaxOldSeq, OldTreeSeq);
+            {_Deleted, _DiskPos, OldTreeSeq, _Size} ->
+                erlang:max(MaxOldSeq, OldTreeSeq);
+            _ ->
+                MaxOldSeq
+        end
+    end,
+    couch_key_tree:fold(FoldFun, UpdateSeq, Tree).
 
-to_doc_info_path(#full_doc_info{id=Id,rev_tree=Tree}) ->
-    RevInfosAndPath =
-        [{#rev_info{deleted=Del,body_sp=Bp,seq=Seq,rev={Pos,RevId}}, Path} ||
-            {{Del, Bp, Seq},{Pos, [RevId|_]}=Path} <-
-            couch_key_tree:get_all_leafs(Tree)],
+to_doc_info_path(#full_doc_info{id=Id,rev_tree=Tree,update_seq=Seq}) ->
+    RevInfosAndPath = [
+        {#rev_info{
+            deleted = element(1, LeafVal),
+            body_sp = element(2, LeafVal),
+            seq = element(3, LeafVal),
+            rev = {Pos, RevId}
+        }, Path} || {LeafVal, {Pos, [RevId | _]} = Path} <-
+            couch_key_tree:get_all_leafs(Tree)
+    ],
     SortedRevInfosAndPath = lists:sort(
             fun({#rev_info{deleted=DeletedA,rev=RevA}, _PathA},
                 {#rev_info{deleted=DeletedB,rev=RevB}, _PathB}) ->
@@ -292,16 +351,13 @@ to_doc_info_path(#full_doc_info{id=Id,rev_tree=Tree}) ->
         end, RevInfosAndPath),
     [{_RevInfo, WinPath}|_] = SortedRevInfosAndPath,
     RevInfos = [RevInfo || {RevInfo, _Path} <- SortedRevInfosAndPath],
-    {#doc_info{id=Id, high_seq=max_seq(RevInfos, 0), revs=RevInfos}, WinPath}.
+    {#doc_info{id=Id, high_seq=max_seq(Tree, Seq), revs=RevInfos}, WinPath}.
 
 
 
 
 att_foldl(#att{data=Bin}, Fun, Acc) when is_binary(Bin) ->
     Fun(Bin, Acc);
-att_foldl(#att{data={Fd,Sp},att_len=Len}, Fun, Acc) when is_tuple(Sp) orelse Sp == null ->
-    % 09 UPGRADE CODE
-    couch_stream:old_foldl(Fd, Sp, Len, Fun, Acc);
 att_foldl(#att{data={Fd,Sp},md5=Md5}, Fun, Acc) ->
     couch_stream:foldl(Fd, Sp, Md5, Fun, Acc);
 att_foldl(#att{data=DataFun,att_len=Len}, Fun, Acc) when is_function(DataFun) ->
@@ -446,22 +502,24 @@ atts_to_mp([Att | RestAtts], Boundary, WriteFun,
 
 
 doc_from_multi_part_stream(ContentType, DataFun) ->
-    Self = self(),
+    Parent = self(),
     Parser = spawn_link(fun() ->
-        couch_httpd:parse_multipart_request(ContentType, DataFun,
-                fun(Next)-> mp_parse_doc(Next, []) end),
-        unlink(Self)
+        {<<"--">>, _, _} = couch_httpd:parse_multipart_request(
+            ContentType, DataFun,
+            fun(Next) -> mp_parse_doc(Next, []) end),
+        unlink(Parent),
+        Parent ! {self(), finished}
         end),
-    Parser ! {get_doc_bytes, self()},
+    Ref = make_ref(),
+    Parser ! {get_doc_bytes, Ref, self()},
     receive 
-    {doc_bytes, DocBytes} ->
-        erlang:put(mochiweb_request_recv, true),
+    {doc_bytes, Ref, DocBytes} ->
         Doc = from_json_obj(?JSON_DECODE(DocBytes)),
         % go through the attachments looking for 'follows' in the data,
         % replace with function that reads the data from MIME stream.
         ReadAttachmentDataFun = fun() ->
-            Parser ! {get_bytes, self()},
-            receive {bytes, Bytes} -> Bytes end
+            Parser ! {get_bytes, Ref, self()},
+            receive {bytes, Ref, Bytes} -> Bytes end
         end,
         Atts2 = lists:map(
             fun(#att{data=follows}=A) ->
@@ -469,7 +527,11 @@ doc_from_multi_part_stream(ContentType, DataFun) ->
             (A) ->
                 A
             end, Doc#doc.atts),
-        {ok, Doc#doc{atts=Atts2}}
+        WaitFun = fun() ->
+            receive {Parser, finished} -> ok end,
+            erlang:put(mochiweb_request_recv, true)
+        end,
+        {ok, Doc#doc{atts=Atts2}, WaitFun, Parser}
     end.
 
 mp_parse_doc({headers, H}, []) ->
@@ -484,29 +546,43 @@ mp_parse_doc({body, Bytes}, AccBytes) ->
         mp_parse_doc(Next, [Bytes | AccBytes])
     end;
 mp_parse_doc(body_end, AccBytes) ->
-    receive {get_doc_bytes, From} ->
-        From ! {doc_bytes, lists:reverse(AccBytes)}
+    receive {get_doc_bytes, Ref, From} ->
+        From ! {doc_bytes, Ref, lists:reverse(AccBytes)}
     end,
-    fun (Next) ->
-        mp_parse_atts(Next)
-    end.
+    fun mp_parse_atts/1.
 
 mp_parse_atts(eof) ->
     ok;
 mp_parse_atts({headers, _H}) ->
-    fun (Next) ->
-        mp_parse_atts(Next)
-    end;
+    fun mp_parse_atts/1;
 mp_parse_atts({body, Bytes}) ->
-    receive {get_bytes, From} ->
-        From ! {bytes, Bytes}
+    receive {get_bytes, Ref, From} ->
+        From ! {bytes, Ref, Bytes}
     end,
-    fun (Next) ->
-        mp_parse_atts(Next)
-    end;
+    fun mp_parse_atts/1;
 mp_parse_atts(body_end) ->
-    fun (Next) ->
-        mp_parse_atts(Next)
+    fun mp_parse_atts/1.
+
+
+abort_multi_part_stream(Parser) ->
+    abort_multi_part_stream(Parser, erlang:monitor(process, Parser)).
+
+abort_multi_part_stream(Parser, MonRef) ->
+    case is_process_alive(Parser) of
+    true ->
+        Parser ! {get_bytes, nil, self()},
+        receive
+        {bytes, nil, _Bytes} ->
+             abort_multi_part_stream(Parser, MonRef);
+        {'DOWN', MonRef, _, _, _} ->
+             ok
+        end;
+    false ->
+        erlang:demonitor(MonRef, [flush])
     end.
 
 
+with_ejson_body(#doc{body = Body} = Doc) when is_binary(Body) ->
+    Doc#doc{body = couch_compress:decompress(Body)};
+with_ejson_body(#doc{body = {_}} = Doc) ->
+    Doc.

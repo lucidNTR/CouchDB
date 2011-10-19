@@ -110,11 +110,8 @@ init(_) ->
     ok = couch_config:register(
         fun("couch_httpd_auth", "auth_cache_size", SizeList) ->
             Size = list_to_integer(SizeList),
-            ok = gen_server:call(?MODULE, {new_max_cache_size, Size}, infinity)
-        end
-    ),
-    ok = couch_config:register(
-        fun("couch_httpd_auth", "authentication_db", DbName) ->
+            ok = gen_server:call(?MODULE, {new_max_cache_size, Size}, infinity);
+        ("couch_httpd_auth", "authentication_db", DbName) ->
             ok = gen_server:call(?MODULE, {new_auth_db, ?l2b(DbName)}, infinity)
         end
     ),
@@ -135,6 +132,7 @@ handle_db_event({Event, DbName}) ->
         case Event of
         deleted -> gen_server:call(?MODULE, auth_db_deleted, infinity);
         created -> gen_server:call(?MODULE, auth_db_created, infinity);
+        compacted -> gen_server:call(?MODULE, auth_db_compacted, infinity);
         _Else   -> ok
         end;
     false ->
@@ -158,26 +156,21 @@ handle_call(auth_db_created, _From, State) ->
     true = ets:insert(?STATE, {auth_db, open_auth_db()}),
     {reply, ok, NewState};
 
+handle_call(auth_db_compacted, _From, State) ->
+    exec_if_auth_db(
+        fun(AuthDb) ->
+            true = ets:insert(?STATE, {auth_db, reopen_auth_db(AuthDb)})
+        end
+    ),
+    {reply, ok, State};
+
+handle_call({new_max_cache_size, NewSize},
+        _From, #state{cache_size = Size} = State) when NewSize >= Size ->
+    {reply, ok, State#state{max_cache_size = NewSize}};
+
 handle_call({new_max_cache_size, NewSize}, _From, State) ->
-    case NewSize >= State#state.cache_size of
-    true ->
-        ok;
-    false ->
-        lists:foreach(
-            fun(_) ->
-                LruTime = ets:last(?BY_ATIME),
-                [{LruTime, UserName}] = ets:lookup(?BY_ATIME, LruTime),
-                true = ets:delete(?BY_ATIME, LruTime),
-                true = ets:delete(?BY_USER, UserName)
-            end,
-            lists:seq(1, State#state.cache_size - NewSize)
-        )
-    end,
-    NewState = State#state{
-        max_cache_size = NewSize,
-        cache_size = erlang:min(NewSize, State#state.cache_size)
-    },
-    {reply, ok, NewState};
+    free_mru_cache_entries(State#state.cache_size - NewSize),
+    {reply, ok, State#state{max_cache_size = NewSize, cache_size = NewSize}};
 
 handle_call({fetch, UserName}, _From, State) ->
     {Credentials, NewState} = case ets:lookup(?BY_USER, UserName) of
@@ -231,6 +224,8 @@ clear_cache(State) ->
     State#state{cache_size = 0}.
 
 
+add_cache_entry(_, _, _, #state{max_cache_size = 0} = State) ->
+    State;
 add_cache_entry(UserName, Credentials, ATime, State) ->
     case State#state.cache_size >= State#state.max_cache_size of
     true ->
@@ -242,16 +237,17 @@ add_cache_entry(UserName, Credentials, ATime, State) ->
     true = ets:insert(?BY_USER, {UserName, {Credentials, ATime}}),
     State#state{cache_size = couch_util:get_value(size, ets:info(?BY_USER))}.
 
+free_mru_cache_entries(0) ->
+    ok;
+free_mru_cache_entries(N) when N > 0 ->
+    free_mru_cache_entry(),
+    free_mru_cache_entries(N - 1).
 
 free_mru_cache_entry() ->
-    case ets:last(?BY_ATIME) of
-    '$end_of_table' ->
-        ok;  % empty cache
-    LruTime ->
-        [{LruTime, UserName}] = ets:lookup(?BY_ATIME, LruTime),
-        true = ets:delete(?BY_ATIME, LruTime),
-        true = ets:delete(?BY_USER, UserName)
-    end.
+    MruTime = ets:last(?BY_ATIME),
+    [{MruTime, UserName}] = ets:lookup(?BY_ATIME, MruTime),
+    true = ets:delete(?BY_ATIME, MruTime),
+    true = ets:delete(?BY_USER, UserName).
 
 
 cache_hit(UserName, Credentials, ATime) ->
@@ -336,7 +332,7 @@ cache_needs_refresh() ->
 
 
 reopen_auth_db(AuthDb) ->
-    case (catch gen_server:call(AuthDb#db.main_pid, get_db, infinity)) of
+    case (catch couch_db:reopen(AuthDb)) of
     {ok, AuthDb2} ->
         AuthDb2;
     _ ->
@@ -396,8 +392,17 @@ ensure_auth_ddoc_exists(Db, DDocId) ->
     {not_found, _Reason} ->
         {ok, AuthDesign} = auth_design_doc(DDocId),
         {ok, _Rev} = couch_db:update_doc(Db, AuthDesign, []);
-    _ ->
-        ok
+    {ok, Doc} ->
+        {Props} = couch_doc:to_json_obj(Doc, []),
+        case couch_util:get_value(<<"validate_doc_update">>, Props, []) of
+            ?AUTH_DB_DOC_VALIDATE_FUNCTION ->
+                ok;
+            _ ->
+                Props1 = lists:keyreplace(<<"validate_doc_update">>, 1, Props,
+                    {<<"validate_doc_update">>,
+                    ?AUTH_DB_DOC_VALIDATE_FUNCTION}),
+                couch_db:update_doc(Db, couch_doc:from_json_obj({Props1}), [])
+        end
     end,
     ok.
 

@@ -99,7 +99,7 @@ function CouchDB(name, httpHeaders) {
         newCount++;
       }
     }
-    var newUuids = CouchDB.newUuids(docs.length);
+    var newUuids = CouchDB.newUuids(newCount);
     var newCount = 0;
     for (var i=0; i<docs.length; i++) {
       if (docs[i]._id == undefined) {
@@ -121,7 +121,7 @@ function CouchDB(name, httpHeaders) {
       CouchDB.maybeThrowError(this.last_req);
       var results = JSON.parse(this.last_req.responseText);
       for (var i = 0; i < docs.length; i++) {
-        if(results[i] && results[i].rev) {
+        if(results[i] && results[i].rev && results[i].ok) {
           docs[i]._rev = results[i].rev;
         }
       }
@@ -272,7 +272,7 @@ function CouchDB(name, httpHeaders) {
       for (var name in options) {
         if (!options.hasOwnProperty(name)) { continue; };
         var value = options[name];
-        if (name == "key" || name == "startkey" || name == "endkey") {
+        if (name == "key" || name == "keys" || name == "startkey" || name == "endkey" || (name == "open_revs" && value !== "all")) {
           value = toJSON(value);
         }
         buf.push(encodeURIComponent(name) + "=" + encodeURIComponent(value));
@@ -471,3 +471,13 @@ CouchDB.params = function(options) {
   }
   return returnArray.join("&");
 };
+// Used by replication test
+if (typeof window == 'undefined' || !window) {
+  CouchDB.host = "127.0.0.1:5984";
+  CouchDB.protocol = "http://";
+  CouchDB.inBrowser = false;
+} else {
+  CouchDB.host = window.location.host;
+  CouchDB.inBrowser = true;
+  CouchDB.protocol = window.location.protocol + "//";
+}
