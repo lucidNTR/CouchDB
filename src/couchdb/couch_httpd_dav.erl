@@ -1,156 +1,3 @@
-% bind_path is based on bind method from Webmachine
-%% Neutrinity Module for URL rewriting.
-
--module(couch_httpd_ntr_rewrite).
--export([handle_rewrite_req/1]).
--include("/opt/local/lib/couchdb/erlang/lib/couch-0.11.0/include/couch_db.hrl").
-
-handle_rewrite_req( #httpd{ path_parts = PathOrig, method = Method, mochi_req = MochiReq } = Req ) ->
-               
-                    %                      Method:   Get/(B)Propfind 
-                    %                                Post/
-                    %                                Put/Mkcol/(B)Proppatch 
-                    %                                (B)DELETE
-                    %                                (B)COPY 
-                    %                                (B)MOVE 
-                    %                                NOTIFY(POLL) SUBSCRIBE UNSUBSCRIBE 
-                    %                                INDEX 
-                    %                                BIND UNBIND
-                    %                                Search
-                    %                                DELTA-V  
-                    %                       Domain:       org.neutrinity
-                    %                       Dataspace:    .jan
-                    %                       *Server:      .server1
-                    %                                     /
-                    %                       (ntrClientHash:ntr#/ or rezeptor#/)
-                    %                       Sources:      Sources/Berliner/
-                    %                       Query:        Resources_by_label.special
-                    %                                     _Stack/Arbeitsplatz
-                    %                                     _by_name/
-                    %                       *Docname/ID:  UUDIasdkj123  (no trailing slash!)      
-                    %                       *Showtmplt:   .Tabelle
-                    %                       *Indextmplt:  .Listenansicht
-                    %                       *Format:      .html -> Request header wird automatisch Angepasst.
-                    %                       *Header:      key=value
-                     
-                    %                     Badges:
-                    %                          unread, 
-                    %                          total items, 
-                    %                          pending, 
-                    %                          workplaced, 
-                    %                          workplaces&unread 
-                    % 
-                    
-                    % TODO: if js is disabled, redirect to path wihtout client# hash and wrap phtml templates in full html template!!!!!! 
-                    % and vice versa
-
-
-%http://127.0.0.1:5984/_ntr/#/jan/_design/neutrinity/_list/html_fullwidth/label.special_AND_name?reduce=false&include_docs=true 
-                               
-                    
-                    %                         #RewriteMap  deflector txt:/path/to/deflector.map
-                    %                       RewriteCond   %{REMOTE_HOST}  !^.+\.ourdomain\.com$
-                    % 
-                    % 
-                    % 
-                    %                       RewriteCond %{HTTP_HOST} ^(jan|jonas)\.neutrintiy\.org [NC]
-                    %                       RewriteRule ^(.*) http://www.yoursite.com/%1/%{REQUEST_URI} [L,P]
-                    % 
-                    %                     #OPTIONS to GET OPTIONS DOC ind XML FORMAT from COUCHDBUSERBASE or directly via header return...
-                    %                         RewriteCond %{REQUEST_METHOD} OPTIONS
-                    %                         RewriteRule   ^/(.*)   http://127.0.0.1:5984/jan/$1 [E=REQUEST_METHOD:GET] [P]
-                    % 
-                    % 
-                    %                     #Rewrite all Neutrinity client requests to Neutrinity Client-Server Path  
-                    %                         RewriteRule   ^/_ntr/(.*) http://127.0.0.1:5984/_ntr/$1 [P]  
-                    % 
-                    %                     #Cath fallthru  
-                    %                       RewriteRule   ^/(.*) http://127.0.0.1:5984/jan/$1 [P]
-% DbName="test",
-% DesignName="test",
-% PathParts=PathOrig,
-%couch_httpd:send_error(Req, 404, <<"DEBUG:">>, <<"Test">>),
-    %DesignId = <<"_design/", DesignName/binary>>,
-    %Prefix = <<"/", DbName/binary, "/", DesignId/binary>>,
-    %QueryList = couch_httpd:qs(Req),
-    %QueryList1 = [{to_atom(K), V} || {K, V} <- QueryList],
-
-    %#doc{body={Props}} = DesignId,
-
-    % % get rules from ddoc
-    %       case couch_util:get_value(<<"rewrites">>, Props) of
-    %           undefined ->
-    %               couch_httpd:send_error(Req, 404, <<"rewrite_error">>,
-    %                               <<"Invalid path.">>);
-    %           Rules ->
-    %               % create dispatch list from rules
-    %               DispatchList =  [make_rule(Rule) || {Rule} <- Rules],
-    %       
-    %               %% get raw path by matching url to a rule.
-    %               RawPath = case try_bind_path(DispatchList, Method, PathParts,
-    %                                       QueryList1) of
-    %                   no_dispatch_path ->
-    %                       throw(not_found);
-    %                   {NewPathParts, Bindings} ->
-    %                       Parts = [mochiweb_util:quote_plus(X) || X <- NewPathParts],
-    %       
-    %                       % build new path, reencode query args, eventually convert
-    %                       % them to json
-    %                       Path = lists:append(
-    %                           string:join(Parts, [?SEPARATOR]),
-    %                           case Bindings of
-    %                               [] -> [];
-    %                               _ -> [$?, encode_query(Bindings)]
-    %                           end),
-    %                       
-    %                       % if path is relative detect it and rewrite path
-    %                       case mochiweb_util:safe_relative_path(Path) of
-    %                           undefined ->
-    %                               ?b2l(Prefix) ++ "/" ++ Path;
-    %                           P1 ->
-    %                               ?b2l(Prefix) ++ "/" ++ P1
-    %                       end
-    %       
-    %                   end,
-
-
-
-%root zu index file fon db jan
-%_couch zu couchroot
-            % normalize final path (fix levels "." and "..")
-            RawPath1 ="/", %?b2l(iolist_to_binary(normalize_path(RawPath))),
-
-            ?LOG_DEBUG("rewrite to ~p ~n", [RawPath1]),
-
-            % build a new mochiweb request
-            MochiReq1 = mochiweb_request:new(MochiReq:get(socket),
-                                             MochiReq:get(method),
-                                             RawPath1,
-                                             MochiReq:get(version),
-                                             MochiReq:get(headers)),
-
-            % cleanup, It force mochiweb to reparse raw uri.
-            MochiReq1:cleanup(),
-
-            #httpd{
-                db_url_handlers = DbUrlHandlers,
-                design_url_handlers = DesignUrlHandlers,
-                default_fun = DefaultFun,
-                url_handlers = UrlHandlers
-            } = Req,
-            couch_httpd:handle_request_int(MochiReq1, DefaultFun, UrlHandlers, DbUrlHandlers, DesignUrlHandlers).
-        %end.
-
-
-
-
-
-
-
-
-
-
-
 % Licensed under the Apache License, Version 2.0 (the "License"); you may not
 % use this file except in compliance with the License. You may obtain a copy of
 % the License at
@@ -163,104 +10,78 @@ handle_rewrite_req( #httpd{ path_parts = PathOrig, method = Method, mochi_req = 
 % License for the specific language governing permissions and limitations under
 % the License.
 %
+
+
 % bind_path is based on bind method from Webmachine
+% @doc Module for URL rewriting by pattern matching.
 
+% (This Module could be inspired by RackDAV a Rack implementation of DAV)
 
-%% @doc Module for URL rewriting by pattern matching.
+% This is the WebDAV handler for CouchDB Design documents, you can mount a databases design doc 
+% by pointing your DAV Client to http://server/database/_appdav/(...) 
+% The nececarry steps are specified as follows:
 
--module(couch_httpd_rewrite).
+% 1. Patch couchdb to accept additional methods: OPTIONS, PROPFIND, PROPPATCH, DELETE, MOVE, COPY
+% (still not exactly clear where to do that...) 
+
+% 2. Catch mehthod OPTIONS for http://server/_appdav and expose that additional methods are 
+% available by generating propper HTTP response
+
+% 3. Catch method PROPFIND ->
+% Path /                            -> get all_dbs and generate dav-xml
+% Path /<db>/                       -> expose all available database handlers as folders (e.g. _design, _view, _list, _show)
+% Path /<db>/_design/               -> get all design docs in <db> and generate dav-xml (each ddoc is a FOLDER!) 
+% Path /<db>/<_design>/<ddoc>       -> get ddoc and expose each key as file or folder based on the following rule...
+    % key is _rev or _id                        -> hide
+    % value is value or array                   -> as file
+    % value is object                           -> as folder
+% Path /<db>/<_design>/<ddoc>/<filename>        -> serve value as filestream
+% Path /<db>/<_design>/<ddoc>/<foldername>      -> expose values as folders or files, based on same rule as above
+% etc. do this to max. depth that is configurable in dav_max_depth in config file
+
+% this should be enough to actually mount the ddoc in osx, do testing and additional specs...
+
+-module(couch_httpd_dav).
+-export([handle_rewrite_req/1]).
 -export([handle_rewrite_req/3]).
 -include("couch_db.hrl").
 
 -define(SEPARATOR, $\/).
 -define(MATCH_ALL, {bind, <<"*">>}).
 
+handle_rewrite_req( #httpd{ path_parts = PathOrig, method = Method, mochi_req = MochiReq } = Req ) ->
+               
+            % normalize final path (fix levels "." and "..")
+            RawPath1 ="/", %?b2l(iolist_to_binary(normalize_path(RawPath))),
 
-%% doc The http rewrite handler. All rewriting is done from
-%% /dbname/_design/ddocname/_rewrite by default.
-%%
-%% each rules should be in rewrites member of the design doc.
-%% Ex of a complete rule :
-%%
-%%  {
-%%      ....
-%%      "rewrites": [
-%%      {
-%%          "from": "",
-%%          "to": "index.html",
-%%          "method": "GET",
-%%          "query": {}
-%%      }
-%%      ]
-%%  }
-%%
-%%  from: is the path rule used to bind current uri to the rule. It
-%% use pattern matching for that.
-%%
-%%  to: rule to rewrite an url. It can contain variables depending on binding
-%% variables discovered during pattern matching and query args (url args and from
-%% the query member.)
-%%
-%%  method: method to bind the request method to the rule. by default "*"
-%%  query: query args you want to define they can contain dynamic variable
-%% by binding the key to the bindings
-%%
-%%
-%% to and from are path with  patterns. pattern can be string starting with ":" or
-%% "*". ex:
-%% /somepath/:var/*
-%%
-%% This path is converted in erlang list by splitting "/". Each var are
-%% converted in atom. "*" is converted to '*' atom. The pattern matching is done
-%% by splitting "/" in request url in a list of token. A string pattern will
-%% match equal token. The star atom ('*' in single quotes) will match any number
-%% of tokens, but may only be present as the last pathtern in a pathspec. If all
-%% tokens are matched and all pathterms are used, then the pathspec matches. It works
-%% like webmachine. Each identified token will be reused in to rule and in query
-%%
-%% The pattern matching is done by first matching the request method to a rule. by
-%% default all methods match a rule. (method is equal to "*" by default). Then
-%% It will try to match the path to one rule. If no rule match, then a 404 error
-%% is displayed.
-%%
-%% Once a rule is found we rewrite the request url using the "to" and
-%% "query" members. The identified token are matched to the rule and
-%% will replace var. if '*' is found in the rule it will contain the remaining
-%% part if it exists.
-%%
-%% Examples:
-%%
-%% Dispatch rule            URL             TO                  Tokens
-%%
-%% {"from": "/a/b",         /a/b?k=v        /some/b?k=v         var =:= b
-%% "to": "/some/"}                                              k = v
-%%
-%% {"from": "/a/b",         /a/b            /some/b?var=b       var =:= b
-%% "to": "/some/:var"}
-%%
-%% {"from": "/a",           /a              /some
-%% "to": "/some/*"}
-%%
-%% {"from": "/a/*",         /a/b/c          /some/b/c
-%% "to": "/some/*"}
-%%
-%% {"from": "/a",           /a              /some
-%% "to": "/some/*"}
-%%
-%% {"from": "/a/:foo/*",    /a/b/c          /some/b/c?foo=b     foo =:= b
-%% "to": "/some/:foo/*"}
-%%
-%% {"from": "/a/:foo",     /a/b             /some/?k=b&foo=b    foo =:= b
-%% "to": "/some",
-%%  "query": {
-%%      "k": ":foo"
-%%  }}
-%%
-%% {"from": "/a",           /a?foo=b        /some/b             foo =:= b
-%% "to": "/some/:foo",
-%%  }}
+            ?LOG_DEBUG("rewrite to ~p ~n", [RawPath1]),
+
+            % build a new mochiweb request
+            MochiReq1 = mochiweb_request:new(MochiReq:get(socket),
+                                             MochiReq:get(method),
+                                             RawPath1,
+                                             MochiReq:get(version),
+                                             MochiReq:get(headers)),
+
+            % cleanup, It forces mochiweb to reparse raw uri.
+            MochiReq1:cleanup(),
+
+            #httpd{
+                db_url_handlers = DbUrlHandlers,
+                design_url_handlers = DesignUrlHandlers,
+                default_fun = DefaultFun,
+                url_handlers = UrlHandlers
+            } = Req,
+            
+            couch_httpd:handle_request_int(MochiReq1, DefaultFun, UrlHandlers, DbUrlHandlers, DesignUrlHandlers).
 
 
+
+
+
+% Only existing couchdb code from url rewriter after this line
+% TODO: rewrite this code to match webdav needs and get rid of 
+% unnecessary code for generic url rewriting...
 
 handle_rewrite_req(#httpd{
         path_parts=[DbName, <<"_design">>, DesignName, _Rewrite|PathParts],
