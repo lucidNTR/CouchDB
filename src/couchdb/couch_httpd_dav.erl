@@ -42,14 +42,144 @@
 % this should be enough to actually mount the ddoc in osx, do testing and additional specs...
 
 -module(couch_httpd_dav).
--export([handle_rewrite_req/1]).
--export([handle_rewrite_req/3]).
+
+-export([handle_dav_req/1]).
+-export([handle_dav_req/3]).
+
 -include("couch_db.hrl").
+
+-import(couch_httpd,
+    [send_json/2,send_json/3,send_response/4,send_json/4,send_method_not_allowed/2,
+    start_json_response/2,send_chunk/2,last_chunk/1,end_json_response/1,
+    start_chunked_response/3, send_error/4]).
 
 -define(SEPARATOR, $\/).
 -define(MATCH_ALL, {bind, <<"*">>}).
+-define(METHODS, '"GET","HEAD","POST","PUT","DELETE","TRACE","CONNECT","COPY","OPTIONS","PROPPATCH","PROPFIND","MOVE"').
+-define(XML_MOCK, ["
+<?xml version=\"1.0\" encoding=\"utf-8\"?>
 
-handle_rewrite_req( #httpd{ path_parts = PathOrig, method = Method, mochi_req = MochiReq } = Req ) ->
+<D:multistatus xmlns:D=\"DAV:\">
+
+	<D:response xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+		<D:href>/</D:href>
+		<D:propstat>
+			<D:prop>
+				<D:getetag>\"9e07ce-0-658fcf77\"</D:getetag>
+				<D:creationdate>2009-05-08T13:13:38Z</D:creationdate>
+				<D:getlastmodified>Fri, 08 May 2009 13:13:38 GMT</D:getlastmodified>
+				<D:displayname/>
+				<D:resourcetype>
+					<D:collection/>
+				</D:resourcetype>
+				<D:getcontentlength>0</D:getcontentlength>
+				<D:getcontenttype>httpd/unix-directory</D:getcontenttype>
+				<D:getcontentlanguage/>
+			</D:prop>
+			<D:status>HTTP/1.1 200 OK</D:status>
+		</D:propstat>
+	</D:response>
+	
+	<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+		<D:href>/Neuer%20Ordner</D:href>
+		<D:propstat>
+			<D:prop>
+				<ns2:executable>T</ns2:executable>
+				<D:getetag>\"9e07db-0-f392ad85\"</D:getetag>
+				<D:creationdate>2010-06-08T00:34:25Z</D:creationdate>
+				<D:getlastmodified>Tue, 08 Jun 2010 00:34:25 GMT</D:getlastmodified>
+				<D:displayname/>
+				<D:resourcetype>
+					<D:collection/>
+				</D:resourcetype>
+				<D:getcontentlength>0</D:getcontentlength>
+				<D:getcontenttype>httpd/unix-directory</D:getcontenttype>
+				<D:getcontentlanguage/>
+			</D:prop>
+			<D:status>HTTP/1.1 200 OK</D:status>
+		</D:propstat>
+	</D:response>
+	
+	<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+		<D:href>/Uni</D:href>
+		<D:propstat>
+			<D:prop>
+				<ns2:executable>T</ns2:executable>
+				<D:getetag>\"9e07e0-0-90a19db\"</D:getetag>
+				<D:creationdate>2010-08-17T18:22:44Z</D:creationdate>
+				<D:getlastmodified>Tue, 17 Aug 2010 18:22:44 GMT</D:getlastmodified>
+				<D:displayname/>
+				<D:resourcetype>
+					<D:collection/>
+				</D:resourcetype>
+				<D:getcontentlength>0</D:getcontentlength>
+				<D:getcontenttype>httpd/unix-directory</D:getcontenttype>
+				<D:getcontentlanguage/>
+				<D:supportedlock>
+					<D:lockentry>
+						<D:lockscope>
+							<D:exclusive/>
+						</D:lockscope>
+						<D:locktype>
+							<D:write/>
+						</D:locktype>
+					</D:lockentry>
+					<D:lockentry>
+						<D:lockscope>
+							<D:shared/>
+						</D:lockscope>
+						<D:locktype>
+							<D:write/>
+						</D:locktype>
+					</D:lockentry>
+				</D:supportedlock>
+				<D:lockdiscovery/>
+			</D:prop>
+			<D:status>HTTP/1.1 200 OK</D:status>
+		</D:propstat>
+	</D:response>
+	
+	<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+		<D:href>/File</D:href>
+		<D:propstat>
+			<D:prop>
+				<ns2:executable>T</ns2:executable>
+				<D:getetag>\"02.16.201\"</D:getetag>
+				<D:creationdate>2010-06-09T05:45:10Z</D:creationdate>
+				<D:getlastmodified>Wed, 09 Jun 2010 05:45:10 GMT</D:getlastmodified>
+				<D:displayname/>
+				<D:resourcetype/>
+				<D:getcontentlength>0</D:getcontentlength>
+				<D:getcontenttype>application/octetstream</D:getcontenttype>
+				<D:getcontentlanguage/>
+			</D:prop>
+			<D:status>HTTP/1.1 200 OK</D:status>
+		</D:propstat>
+	</D:response>
+	
+</D:multistatus> "]).
+
+handle_dav_req( #httpd{ method = 'OPTIONS' } = Req ) ->       
+    OptionsHeaders = [
+        {"Allow", ?METHODS},
+        {"DAV", "1"}
+    ],
+    send_json(Req, 200, OptionsHeaders, {[
+        {couchdb, "sends you the _dav OPTIONS"}
+    ]});
+
+%Implement Depth up to depth = 3!
+handle_dav_req( #httpd{ path_parts =  [<<"_dav">>] , method = 'PROPFIND' } = Req ) ->      
+    Headers = [ {"DAV", "1"},{"Content-Type", "text/xml; charset= \"utf-8\" "}],
+    send_response(Req, 207, Headers, ?XML_MOCK).
+
+
+%Implement OS-X Hidden Files serving from Folder, stupid osx request rejection and Windows special fields
+
+
+
+
+handle_dav_req( #httpd{ path_parts = PathOrig, method = Method, mochi_req = MochiReq } = Req, _ ) ->
                
             % normalize final path (fix levels "." and "..")
             RawPath1 ="/", %?b2l(iolist_to_binary(normalize_path(RawPath))),
@@ -83,7 +213,7 @@ handle_rewrite_req( #httpd{ path_parts = PathOrig, method = Method, mochi_req = 
 % TODO: rewrite this code to match webdav needs and get rid of 
 % unnecessary code for generic url rewriting...
 
-handle_rewrite_req(#httpd{
+handle_dav_req(#httpd{
         path_parts=[DbName, <<"_design">>, DesignName, _Rewrite|PathParts],
         method=Method,
         mochi_req=MochiReq}=Req, _Db, DDoc) ->
