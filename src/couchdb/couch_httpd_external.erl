@@ -129,7 +129,7 @@ send_external_response(#httpd{mochi_req=MochiReq}=Req, Response) ->
     couch_httpd:log_request(Req, Code),
     Resp = MochiReq:respond({Code,
         default_or_content_type(CType, Headers ++
-            couch_httpd:server_header() ++ couch_httpd_cors:headers()), Data}),
+            couch_httpd:server_header()), Data}),
     {ok, Resp}.
 
 parse_external_response({Response}) ->
