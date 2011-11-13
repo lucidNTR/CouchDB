@@ -11,6 +11,11 @@
 % the License.
 %
 
+% DB Icon design without Couch Overlay:
+%Designer:
+%Barry Mieny
+%Lizenz:
+%Creative Commons Attribution
 
 % bind_path is based on bind method from Webmachine
 % @doc Module for URL rewriting by pattern matching.
@@ -47,25 +52,150 @@
 -export([handle_dav_req/3]).
 
 -include("couch_db.hrl").
+-include("/usr/local/lib/erlang/lib/xmerl-1.2.10/include/xmerl.hrl").
 
 -import(couch_httpd,
     [send_json/2,send_json/3,send_response/4,send_json/4,send_method_not_allowed/2,
     start_json_response/2,send_chunk/2,last_chunk/1,end_json_response/1,
-    start_chunked_response/3, send_error/4]).
+    start_chunked_response/3, send_error/4, error_info/1]).
 
+-define(DAV_PATH, "/Users/jan/Entwicklung/Ntr/Repo/CouchDB/opt/share/couchdb/dav_fs/").
 -define(SEPARATOR, $\/).
 -define(MATCH_ALL, {bind, <<"*">>}).
--define(METHODS, '"GET","HEAD","POST","PUT","DELETE","TRACE","CONNECT","COPY","OPTIONS","PROPPATCH","PROPFIND","MOVE"').
--define(XML_MOCK, ["
-<?xml version=\"1.0\" encoding=\"utf-8\"?>
-
+-define(METHODS, "GET,HEAD,POST,PUT,DELETE,TRACE,CONNECT,COPY,OPTIONS,PROPPATCH,PROPFIND,MOVE").
+-define(XML_MOCK, ["<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <D:multistatus xmlns:D=\"DAV:\">
+<D:response xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+<D:href>/_dav/</D:href>
+<D:propstat>
+<D:prop>
+<D:creationdate>2009-05-08T13:13:38Z</D:creationdate>
+<D:getlastmodified>Fri, 08 May 2009 13:13:38 GMT</D:getlastmodified>
+<D:displayname>CouchDB</D:displayname>
+<D:resourcetype><D:collection/></D:resourcetype>
+<D:getcontentlength>0</D:getcontentlength>
+<D:getcontenttype>httpd/unix-directory</D:getcontenttype>
+<D:getcontentlanguage></D:getcontentlanguage>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+<D:href>/_dav/Ordner</D:href>
+<D:propstat>
+<D:prop>
+<ns2:executable>T</ns2:executable>
+<D:creationdate>2010-06-08T00:34:25Z</D:creationdate>
+<D:getlastmodified>Tue, 08 Jun 2010 00:34:25 GMT</D:getlastmodified>
+<D:displayname></D:displayname>
+<D:resourcetype><D:collection/></D:resourcetype>
+<D:getcontentlength>0</D:getcontentlength>
+<D:getcontenttype>httpd/unix-directory</D:getcontenttype>
+<D:getcontentlanguage></D:getcontentlanguage>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+<D:href>/_dav/.DS_Store</D:href>
+<D:propstat>
+<D:prop>
+<ns2:executable>T</ns2:executable>
+<D:creationdate>2009-05-26T18:12:46Z</D:creationdate>
+<D:getlastmodified>Sat, 12 Nov 2011 23:31:14 GMT</D:getlastmodified>
+<D:displayname></D:displayname>
+<D:resourcetype></D:resourcetype>
+<D:getcontenttype>application/octetstream</D:getcontenttype>
+<D:getcontentlanguage></D:getcontentlanguage>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+<D:href>/_dav/.VolumeIcon.icns</D:href>
+<D:propstat>
+<D:prop>
+<ns2:executable>T</ns2:executable>
+<D:creationdate>2011-11-12T23:38:13Z</D:creationdate>
+<D:getlastmodified>Sat, 12 Nov 2011 23:38:14 GMT</D:getlastmodified>
+<D:displayname></D:displayname>
+<D:resourcetype></D:resourcetype>
+<D:getcontenttype>application/octetstream</D:getcontenttype>
+<D:getcontentlanguage></D:getcontentlanguage>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+<D:href>/_dav/._.</D:href>
+<D:propstat>
+<D:prop>
+<ns2:executable>T</ns2:executable>
+<D:creationdate>2011-11-12T23:38:16Z</D:creationdate>
+<D:getlastmodified>Sat, 12 Nov 2011 23:38:16 GMT</D:getlastmodified>
+<D:displayname></D:displayname>
+<D:resourcetype></D:resourcetype>
+<D:getcontenttype>application/octetstream</D:getcontenttype>
+<D:getcontentlanguage></D:getcontentlanguage>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+<D:href>/_dav/._.VolumeIcon.icns</D:href>
+<D:propstat>
+<D:prop>
+<ns2:executable>T</ns2:executable>
+<D:creationdate>2011-11-12T23:38:13Z</D:creationdate>
+<D:getlastmodified>Sat, 12 Nov 2011 23:38:13 GMT</D:getlastmodified>
+<D:displayname></D:displayname>
+<D:resourcetype></D:resourcetype>
+<D:getcontentlength>4096</D:getcontentlength>
+<D:getcontenttype>application/octetstream</D:getcontenttype>
+<D:getcontentlanguage></D:getcontentlanguage>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+<D:href>/_dav/._file.txt</D:href>
+<D:propstat>
+<D:prop>
+<ns2:executable>T</ns2:executable>
+<D:creationdate>2011-11-12T19:10:33Z</D:creationdate>
+<D:getlastmodified>Sat, 12 Nov 2011 19:10:33 GMT</D:getlastmodified>
+<D:displayname></D:displayname>
+<D:resourcetype></D:resourcetype>
+<D:getcontenttype>application/octetstream</D:getcontenttype>
+<D:getcontentlanguage></D:getcontentlanguage>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+<D:href>/_dav/file.txt</D:href>
+<D:propstat>
+<D:prop>
+<ns2:executable>T</ns2:executable>
+<D:creationdate>2011-11-12T19:10:28Z</D:creationdate>
+<D:getlastmodified>Sat, 12 Nov 2011 19:10:28 GMT</D:getlastmodified>
+<D:displayname></D:displayname>
+<D:resourcetype></D:resourcetype>
+<D:getcontentlength>14</D:getcontentlength>
+<D:getcontenttype>application/octetstream</D:getcontenttype>
+<D:getcontentlanguage></D:getcontentlanguage>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+</D:multistatus>"]).
 
+-define(XML_emptyfolder_MOCK, ["<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<D:multistatus xmlns:D=\"DAV:\">
 	<D:response xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
-		<D:href>/</D:href>
+		<D:href>/_dav/Ordner</D:href>
 		<D:propstat>
 			<D:prop>
-				<D:getetag>\"9e07ce-0-658fcf77\"</D:getetag>
 				<D:creationdate>2009-05-08T13:13:38Z</D:creationdate>
 				<D:getlastmodified>Fri, 08 May 2009 13:13:38 GMT</D:getlastmodified>
 				<D:displayname/>
@@ -78,108 +208,118 @@
 			</D:prop>
 			<D:status>HTTP/1.1 200 OK</D:status>
 		</D:propstat>
-	</D:response>
-	
-	<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
-		<D:href>/Neuer%20Ordner</D:href>
-		<D:propstat>
-			<D:prop>
-				<ns2:executable>T</ns2:executable>
-				<D:getetag>\"9e07db-0-f392ad85\"</D:getetag>
-				<D:creationdate>2010-06-08T00:34:25Z</D:creationdate>
-				<D:getlastmodified>Tue, 08 Jun 2010 00:34:25 GMT</D:getlastmodified>
-				<D:displayname/>
-				<D:resourcetype>
-					<D:collection/>
-				</D:resourcetype>
-				<D:getcontentlength>0</D:getcontentlength>
-				<D:getcontenttype>httpd/unix-directory</D:getcontenttype>
-				<D:getcontentlanguage/>
-			</D:prop>
-			<D:status>HTTP/1.1 200 OK</D:status>
-		</D:propstat>
-	</D:response>
-	
-	<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
-		<D:href>/Uni</D:href>
-		<D:propstat>
-			<D:prop>
-				<ns2:executable>T</ns2:executable>
-				<D:getetag>\"9e07e0-0-90a19db\"</D:getetag>
-				<D:creationdate>2010-08-17T18:22:44Z</D:creationdate>
-				<D:getlastmodified>Tue, 17 Aug 2010 18:22:44 GMT</D:getlastmodified>
-				<D:displayname/>
-				<D:resourcetype>
-					<D:collection/>
-				</D:resourcetype>
-				<D:getcontentlength>0</D:getcontentlength>
-				<D:getcontenttype>httpd/unix-directory</D:getcontenttype>
-				<D:getcontentlanguage/>
-				<D:supportedlock>
-					<D:lockentry>
-						<D:lockscope>
-							<D:exclusive/>
-						</D:lockscope>
-						<D:locktype>
-							<D:write/>
-						</D:locktype>
-					</D:lockentry>
-					<D:lockentry>
-						<D:lockscope>
-							<D:shared/>
-						</D:lockscope>
-						<D:locktype>
-							<D:write/>
-						</D:locktype>
-					</D:lockentry>
-				</D:supportedlock>
-				<D:lockdiscovery/>
-			</D:prop>
-			<D:status>HTTP/1.1 200 OK</D:status>
-		</D:propstat>
-	</D:response>
-	
-	<D:response xmlns:ns2=\"http://apache.org/dav/props/\" xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
-		<D:href>/File</D:href>
-		<D:propstat>
-			<D:prop>
-				<ns2:executable>T</ns2:executable>
-				<D:getetag>\"02.16.201\"</D:getetag>
-				<D:creationdate>2010-06-09T05:45:10Z</D:creationdate>
-				<D:getlastmodified>Wed, 09 Jun 2010 05:45:10 GMT</D:getlastmodified>
-				<D:displayname/>
-				<D:resourcetype/>
-				<D:getcontentlength>0</D:getcontentlength>
-				<D:getcontenttype>application/octetstream</D:getcontenttype>
-				<D:getcontentlanguage/>
-			</D:prop>
-			<D:status>HTTP/1.1 200 OK</D:status>
-		</D:propstat>
-	</D:response>
-	
-</D:multistatus> "]).
+	</D:response>	
+</D:multistatus>"]).
 
-handle_dav_req( #httpd{ method = 'OPTIONS' } = Req ) ->       
+-define(XML_File_start_MOCK, 
+"<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<D:multistatus xmlns:D=\"DAV:\">
+<D:response  xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://apache.org/dav/props/\">
+<D:href>/_dav/"
+).
+
+-define(XML_File_end_MOCK,
+"</D:href>
+<D:propstat>
+<D:prop>
+<D:creationdate>2011-11-12T18:17:32Z</D:creationdate>
+<D:getlastmodified>Sat, 12 Nov 2011 18:17:35 GMT</D:getlastmodified>
+<D:displayname></D:displayname>
+<D:resourcetype></D:resourcetype>
+<D:getcontenttype>application/octetstream</D:getcontenttype>
+<D:getcontentlanguage></D:getcontentlanguage>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+</D:multistatus>").
+
+
+handle_dav_req( #httpd{ path_parts = Path, method = Method, mochi_req = MochiReq } = Req ) ->
+    case  Path of
+        [<<"_dav">>] ->
+            case Method of
+                'PROPFIND' -> send_dbs( Req, 1 );
+                'OPTIONS' -> send_options( Req );
+                _ -> ok end;
+        [<<"_dav">>, <<$., Filename/binary>> ] -> handle_fs_file( Method, Filename, Req );
+        [<<"_dav">>, DB_Name ] -> ok;
+        _ -> send_error( Req, 500, "Unknown Error", "Youre stupid" ) end.
+
+
+% Handle all OPTIONS reqs
+send_options( Req ) ->       
     OptionsHeaders = [
         {"Allow", ?METHODS},
-        {"DAV", "1"}
+        {"DAV", "1,2"}
     ],
     send_json(Req, 200, OptionsHeaders, {[
         {couchdb, "sends you the _dav OPTIONS"}
-    ]});
+    ]}).
 
-%Implement Depth up to depth = 3!
-handle_dav_req( #httpd{ path_parts =  [<<"_dav">>] , method = 'PROPFIND' } = Req ) ->      
-    Headers = [ {"DAV", "1"},{"Content-Type", "text/xml; charset= \"utf-8\" "}],
+% Allow only to Serveradmin
+% concurrenting writes? 
+% disallow or mask . and .. folders 
+% Filter funktion to decide what files go to disk and what to design doc
+% Expose local.ini
+
+% Handle Path /
+% TODO:Implement PROPFIND Depth 1, 2, 3 and too deep!
+send_dbs( Req, _Depth ) ->      
+    Headers = [ {"Content-Type", "text/xml; charset= \"utf-8\" "},{"Connection", "Keep-Alive"}],
     send_response(Req, 207, Headers, ?XML_MOCK).
+    
+          
+% Serve hidden files from dav_fs folder (eg. for special OS X Filesystem files)      
+handle_fs_file( 'PROPFIND', Filename, Req ) ->      
+        case filelib:is_regular( ?DAV_PATH ++ binary_to_list(Filename) ) of
+            true ->
+                Headers = [ 
+                    {"Content-Type", "text/xml; charset= \"utf-8\" "},
+                    {"Connection", "Keep-Alive"},
+                    {"Vary", "Accept-Encoding"}
+                    ],
+                send_response(
+                    Req, 
+                    207, 
+                    Headers, 
+                    [ ?XML_File_start_MOCK ++ "." ++ binary_to_list(Filename) ++ ?XML_File_end_MOCK ] );
+            false -> 
+                send_error(Req, 404, "Error", "The requested hidden System File does not exist") end;
+handle_fs_file( 'GET', Filename, Req ) ->      
+    {{Year,Month,Day},Time} = erlang:localtime(),
+    OneYearFromNow = {{Year+1,Month,Day},Time},
+    Headers = [
+        {"Content-Type", "none"},
+        {"Accept-Ranges", "bytes"},
+        {"Connection", "Keep-Alive"},
+        {"Cache-Control", "public, max-age=31536000"},
+        {"Expires", httpd_util:rfc1123_date(OneYearFromNow)}],
+    couch_httpd:serve_file(
+        Req,
+        binary_to_list(Filename), 
+        "/Users/jan/Entwicklung/Ntr/Repo/CouchDB/opt/share/couchdb/dav_fs", 
+        Headers);
+handle_fs_file( 'DELETE', Filename, Req ) ->      
+    Headers = [{"Content-Type", "none"}].
+    % del(
+    %         Req, 
+    %         binary_to_list(Filename), 
+    %         "/Users/jan/Entwicklung/Ntr/Repo/CouchDB/opt/share/couchdb/dav_fs", 
+    %         Headers).
+    
 
 
-%Implement OS-X Hidden Files serving from Folder, stupid osx request rejection and Windows special fields
 
 
 
 
-handle_dav_req( #httpd{ path_parts = PathOrig, method = Method, mochi_req = MochiReq } = Req, _ ) ->
+
+
+
+
+
+handle_dav_req( #httpd{ path_parts = _PathOrig, method = _Method, mochi_req = MochiReq } = Req, _ ) ->
                
             % normalize final path (fix levels "." and "..")
             RawPath1 ="/", %?b2l(iolist_to_binary(normalize_path(RawPath))),
