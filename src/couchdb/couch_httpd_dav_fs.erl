@@ -1,12 +1,12 @@
 -module(couch_httpd_dav_fs).
--export([options/0, get/2, delete/1, delete/2, put/2, make_dav_entry/2, is_directory/1, get_children/3, trans_opt/1 ]).
--include_lib("/usr/local/lib/erlang/lib/kernel-2.14.5/include/file.hrl").
+-export([options/0, get/2, mkcol/2, delete/1, copy/2, move/3, put/2, is_directory/1, get_children/4, trans_opt/1 ]).
+-include_lib("kernel/include/file.hrl").
 -include("couch_db.hrl").
 
 -define(DAV_PATH, couch_config:get("web_dav", "dav_dir")).
 
 -define(R_METHODS,  "GET,HEAD,OPTIONS,PROPFIND").
--define(W_METHODS,  "POST,PUT,DELETE,PROPPATCH,MOVE,LOCK,UNLOCK,MKCOL").
+-define(W_METHODS,  "PUT,DELETE,MOVE,MKCOL").
 
 
 options() ->
@@ -21,96 +21,96 @@ trans_opt( Dav_Opts ) ->
     {RelPath, Name}.
 
 
-get( { RelPath, Name}, Req ) ->
+get( { RelPath, Name }, Req ) ->
     {{Year,Month,Day},Time} = erlang:localtime(),
     OneYearFromNow = {{Year+1,Month,Day},Time},
+    F = element(2, file:read_file_info(?DAV_PATH ++ "/" ++ RelPath ++ Name)),
     Headers = [
         {"Content-Type", "none"},
         {"Accept-Ranges", "bytes"},
         {"Connection", "Keep-Alive"},
         {"Cache-Control", "public, max-age=31536000"},
+        {"Etag", 
+            binary_to_list( 
+                couch_httpd:make_etag(
+                    integer_to_list(F#file_info.size) ++ httpd_util:rfc1123_date(F#file_info.mtime) ) )},
         {"Expires", httpd_util:rfc1123_date(OneYearFromNow)}],
     couch_httpd:serve_file( Req, Name, ?DAV_PATH ++ "/" ++ RelPath, Headers).
 
 
 put( { RelPath, Name}, #httpd{ mochi_req = MochiReq } = Req ) ->
-    Path = ?DAV_PATH ++ "/" ++ RelPath ++ Name,
-    Fun = case couch_httpd:body_length(Req) of
-                    undefined ->
-                        <<"">>;
-                    {unknown_transfer_encoding, Unknown} ->
-                        exit({unknown_transfer_encoding, Unknown});
-                    chunked ->
-                        fun(MaxChunkSize, ChunkFun, InitState) ->
-                            couch_httpd:recv_chunked(Req, MaxChunkSize,
-                                ChunkFun, InitState) end;
-                    0 ->
-                        <<"">>;
-                    TLength when is_integer(TLength) ->
-                        Expect = case couch_httpd:header_value(Req, "expect") of
-                                     undefined ->
-                                         undefined;
-                                     Value when is_list(Value) ->
-                                         string:to_lower(Value) end,
-                        case Expect of
-                            "100-continue" ->
-                                MochiReq:start_raw_response({100, gb_trees:empty()});
-                            _Else ->
-                                ok end,
-                        fun(Size) -> couch_httpd:recv(Req, Size) end end,
-    FileLength = case couch_httpd:header_value(Req,"Content-Length") of
-        undefined ->
-            undefined;
-        Length ->
-            list_to_integer(Length)
-        end,
-    case flush_file( Path, Fun, FileLength ) of
-        ok ->
-            couch_httpd:send_json(Req, 200, {[ {ok, true} ]});
-        Error ->
-            couch_httpd:send_error(Req, 409, Error) end.
-flush_file(Path, Fun, undefined) ->
-    Fun(4096,
+    case maybe_mkdir(RelPath) of
+        ok -> 
+            Path = ?DAV_PATH ++ "/" ++ RelPath ++ Name,
+            case file:open(Path, [raw, read, write, delayed_write, read_ahead]) of
+                {ok, Fd} -> 
+                    case flush_file( MochiReq, Fd ) of
+                        ok ->
+                           file:close(Fd),
+                           couch_httpd:send_json(Req, 200, {[ {ok, true} ]});
+                        Error ->
+                           file:close(Fd),
+                           couch_httpd:send_error(Req, 409, Error) end;
+                Err -> 
+                    couch_httpd:send_error(Req, 409, Err) end;
+        error -> 
+            couch_httpd:send_error(Req, 409, <<"Could not create recursive Directories.">>) end.
+flush_file( MochiReq, Fd ) -> 
+    MochiReq:stream_body(
+        64000,
         fun({0, Footers}, _) ->
             F = mochiweb_headers:from_binary(Footers),
             case mochiweb_headers:get_value("Content-MD5", F) of
-            undefined ->
-                ok;
-            Md5 ->
-                {md5, base64:decode(Md5)}
-            end;
-        ({_Length, Chunk}, _) ->
-            file_write( Path, Chunk)
-        end, ok);
-flush_file( Path, Fun, AttLen) ->
-    write_streamed_file( Path, Fun, AttLen).  
-write_streamed_file( _Path, _Fun, 0) ->
-    ok;
-write_streamed_file( Path, Fun, LenLeft ) when LenLeft > 0 ->
-    Bin = read_next_chunk( Fun, LenLeft ),
-    ok = file_write( Path, Bin),
-    write_streamed_file( Path, Fun, LenLeft - size(Bin) ).
-read_next_chunk(Fun, _) when is_function(Fun, 0) ->
-    Fun();
-read_next_chunk(Fun, LenLeft) when is_function(Fun, 1) ->
-    Fun(lists:min([LenLeft, 16#2000])).
-file_write(Path, Bin) ->
-    case file:open(Path, [raw,write]) of
-        {ok, Fd} ->       
-            try
-                ok = file:write(Fd, Bin),
-                file:close(Fd)
-            catch
-                _:Err2 ->
-                    file:close(Fd),
-                    Err2 end;
-    Err3 ->
-        Err3 end.
+                undefined ->
+                    ok;
+                Md5 ->
+                    {md5, base64:decode(Md5)} end;
+            ({_Length, Chunk}, _) ->
+                file_write( Fd, Chunk) end,
+        ok).
+file_write(Fd, Bin ) ->      
+    try
+        ok = file:write(Fd, Bin)
+    catch
+        _:Err ->
+            file:close(Fd),
+            Err end.
 
-
-delete ({ RelPath, Name } ) ->
+maybe_mkdir(RelPath) ->
+    ThisPath= ?DAV_PATH ++ "/" ++ RelPath,
+    RelUp = string:substr( 
+        string:strip(RelPath, right, $/) , 
+        1, 
+        string:rchr(
+            string:strip(RelPath, right, $/), 
+            $/ ) ),
+    UpPath = ?DAV_PATH ++ "/" ++ RelUp,
+    case file:read_file_info( ThisPath ) of
+        { ok, Dir } -> ok;
+        _ -> 
+            case file:read_file_info( UpPath ) of
+                { ok, Dir } -> file:make_dir( ThisPath ), ok;
+                _ -> 
+                    case maybe_mkdir( RelUp ) of
+                        ok -> file:make_dir( ThisPath ), ok;
+                        _ -> error end end end.
+        
+mkcol({ RelPath, Name }, Req ) ->
     Path = ?DAV_PATH ++ "/" ++ RelPath ++ Name,
-    delete (Path);                    
+    file:make_dir(Path),
+    couch_httpd:send_json( Req, 200, {[{successful, <<"created directory">>}]} ).
+
+
+copy({ RelPath, Name }, Req) ->
+    couch_httpd:send_json( Req, 200, {[{successful, <<"copied">>}]} ).
+
+
+move({ RelPath, Name }, Dest, #httpd{ mochi_req = MochiReq }=Req) ->
+    file:rename(?DAV_PATH ++ "/" ++ RelPath ++ Name, ?DAV_PATH ++ Dest).
+
+delete({ RelPath, Name } ) ->
+    Path = ?DAV_PATH ++ "/" ++ RelPath ++ Name,
+    delete( Path );                    
 delete( Path ) ->
     case file:read_file_info(Path) of
         {ok, F} when F#file_info.type == directory ->
@@ -152,28 +152,40 @@ is_directory( { RelPath, Name } ) ->
     _Else -> no_exist end.
 
         
-get_children( { RelPath, Name }, N, Url ) ->   
-    Base = [{ RelPath, Name, Url }],
-    if 
-        N>0 -> 
-            { ok, L } = file:list_dir( ?DAV_PATH ++ "/" ++ RelPath ++ Name ),
-            Base ++ [{ RelPath ++ Name ++ "/", TempName, Url ++ "/" ++ TempName } || TempName <- L  ];
-        true -> Base end.
-
-    
+get_children( { RelPath, Name }, N, Url, _ ) ->   
+    case file:read_file_info( ?DAV_PATH ++ "/" ++ RelPath ++ Name ) of
+        { ok, _Info } -> 
+            Base = [{ RelPath, Name, Url }],
+            Total = if 
+                N>0 -> 
+                    { ok, L } = file:list_dir( ?DAV_PATH ++ "/" ++ RelPath ++ Name ),
+                    Base ++ [{ RelPath ++ Name ++ "/", TempName, Url ++ "/" ++ TempName } || TempName <- L  ];
+                true -> Base end,
+            lists:map( 
+                fun( {RelPath, Name, TempUrl} ) -> make_dav_entry( { RelPath, Name }, TempUrl ) end, Total );
+        _Else -> [] end.
 make_dav_entry({ RelPath, Name }, Url) ->
-    F = element(2, file:read_file_info(?DAV_PATH ++ "/" ++ RelPath ++ Name)),
-        {response, [], [
-            {href, [], [ Url ]},
-            {propstat, [], [
-                {prop, [], [
-                    {name, [], [Name]},
-                    {displayname, [], [Name]},
-                    {creationdate, [], [httpd_util:rfc1123_date(F#file_info.ctime)]}, 
-                    {getlastmodified, [], [httpd_util:rfc1123_date(F#file_info.mtime)]},
-                    {getcontentlength, [], [integer_to_list(F#file_info.size)]},
-                    {resourcetype, [], if F#file_info.type == directory -> [{collection, [], []}]; true ->[] end }
-                    %{ishidden, [], [ F#file_info.is_hidden ]} 
-                    %etag and inspect rest of file_info record!
-                ]},
-                {status, [], ["HTTP/1.1 200 OK"] } ]} ]}.
+    case file:read_file_info(?DAV_PATH ++ "/" ++ RelPath ++ Name) of
+        { ok, F } ->
+            {response, [], [
+                {href, [], [ Url ]},
+                {propstat, [], [
+                    {prop, [], [
+                        {name, [], [Name]},
+                        {displayname, [], [Name]},
+                        {creationdate, [], [httpd_util:rfc1123_date(F#file_info.ctime)]}, 
+                        {getlastmodified, [], [httpd_util:rfc1123_date(F#file_info.mtime)]},
+                        {getcontentlength, [], [integer_to_list(F#file_info.size)]},
+                        {getetag, [], [
+                            binary_to_list( 
+                                couch_httpd:make_etag(
+                                    integer_to_list(F#file_info.size) ++ httpd_util:rfc1123_date(F#file_info.mtime) ) )]},
+                        {resourcetype, [], if F#file_info.type == directory -> [{collection, [], []}]; true ->[] end },
+                        %{ishidden, [], [ F#file_info.is_hidden ]}
+                        {supportedlock, [], []},
+                        {lockdiscovery, [], []} ]},
+                    {status, [], ["HTTP/1.1 200 OK"] } ]} ]};
+        _Error -> 
+            {response, [], [
+                {propstat, [], [ 
+                    {status, [ RelPath ++ Name ], ["HTTP/1.1 500 Error"] } ]} ]} end.
