@@ -167,7 +167,7 @@ recv(Length, Timeout) ->
 %% @spec body_length() -> undefined | chunked | unknown_transfer_encoding | integer()
 %% @doc  Infer body length from transfer-encoding and content-length headers.
 body_length() ->
-    case get_header_value("transfer-encoding") of
+    case get_header_value("transfer-encoding") of 
         undefined ->
             case get_header_value("content-length") of
                 undefined ->
@@ -175,12 +175,13 @@ body_length() ->
                 Length ->
                     list_to_integer(Length)
             end;
+        "Chunked" ->
+            chunked;
         "chunked" ->
             chunked;
         Unknown ->
             {unknown_transfer_encoding, Unknown}
     end.
-
 
 %% @spec recv_body() -> binary()
 %% @doc Receive the body of the HTTP request (defined by Content-Length).
@@ -238,7 +239,7 @@ stream_body(MaxChunkSize, ChunkFun, FunState, MaxBodyLength) ->
             % chunk.
             stream_chunked_body(MaxChunkSize, ChunkFun, FunState);
         0 ->
-            <<>>;
+            ChunkFun({0, <<"">>}, FunState);
         Length when is_integer(Length) ->
             case MaxBodyLength of
             MaxBodyLength when is_integer(MaxBodyLength), MaxBodyLength < Length ->
