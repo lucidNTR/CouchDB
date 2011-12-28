@@ -119,3 +119,4 @@ etc/.DS_Store
 share/.DS_Store
 src/.DS_Store
 *.state
+share/dav_fs/noe/*
