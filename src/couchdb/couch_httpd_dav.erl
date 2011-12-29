@@ -47,21 +47,37 @@
 -include_lib("xmerl/include/xmerl.hrl").
 
 -define(DAV_FILES, couch_config:get("web_dav", "dav_files_on_fs")).
+-define(DAV_SUBSTR, couch_config:get("web_dav", "dav_file_name_parts_on_fs")).
+-define(DAV_CHARS, couch_config:get("web_dav", "dav_no_decode")).
 -define(DAV_MOUNT, couch_config:get("web_dav", "dav_mount_name")).
 
 -define(XML_PROLOG, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>").
 
-handle_dav_req( #httpd{ path_parts = Path, method = Method, user_ctx = UserCtx } = Req ) ->
+handle_dav_req( #httpd{ method = Method, user_ctx = UserCtx, mochi_req = MochiReq } = Req ) ->
     %ok = couch_httpd:verify_is_server_admin(Req),
     Mount = list_to_binary(?DAV_MOUNT),
+    
+    RawUri = MochiReq:get(raw_path),
+    {"/" ++ Pth, _, _} = mochiweb_util:urlsplit_path(RawUri),
+    Path = [ ?l2b( maybe_unquote(Part) ) || Part <- string:tokens(Pth, "/") ],
+    
+    PathFs = fun(Name) -> 
+        case lists:member(binary_to_list(Name), re:split(?DAV_FILES, ", ",[{return, list}])) of
+            false ->
+                case 
+                    lists:member(
+                        1, 
+                        [ string:str(binary_to_list(Name), SubString) || SubString <- re:split(?DAV_SUBSTR, ", ",[{return, list}]) ]) of
+                    true    -> true;
+                    false   -> false end;
+            true -> true end end,
+    
     case Path of
         [ _, Mount ] ->
              handle_methods( couch_httpd_dav_srv, Method, {}, Req);
         [ _, Mount | Tail ] ->
             % Does Path contain a segment that is in the configured list of things to be stored on filesystem?
-            case lists:any(
-                fun(Name) -> lists:member(binary_to_list(Name), re:split(?DAV_FILES, ", ",[{return, list}])) end,
-                Tail) of
+            case lists:any( PathFs, Tail ) of
                 true ->
                      handle_methods( couch_httpd_dav_fs, Method, { Tail }, Req );       
                 false ->
@@ -86,7 +102,18 @@ handle_dav_req( #httpd{ path_parts = Path, method = Method, user_ctx = UserCtx }
                             handle_methods( couch_httpd_dav_doc, Method, { Dbname, UserCtx, "_all_docs", Doc_Name, Doc_Path}, Req );
                         
                         _ -> couch_httpd:send_error( Req, not_found ) end end end.
-    
+
+% TODO: handle case with more than one url encoded character in name!
+maybe_unquote(UrlEncodedName) ->
+    case 
+        lists:member(
+            1, 
+            [ string:str(UrlEncodedName, SubString) || SubString <- re:split(?DAV_CHARS, ", ",[{return, list}]) ])of
+            true -> 
+                mochiweb_util:unquote(UrlEncodedName);
+            false ->
+                UrlEncodedName end.   
+
 handle_methods( Module, Method, Dav_Opts, Req) ->       
     case Method of
         'OPTIONS'   -> handle_options( Module, Dav_Opts, Req);
