@@ -11,7 +11,8 @@
 ## the License.
 
 SUBDIRS = \
-    couch_index \
+	couch_dav \
+	couch_index \
     couch_mrview \
     couchdb \
     ejson \
