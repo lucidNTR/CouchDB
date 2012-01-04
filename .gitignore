@@ -120,3 +120,7 @@ share/.DS_Store
 src/.DS_Store
 *.state
 share/dav_fs/noe/*
+src/couch_dav/src/couch_dav_todo.erl
+Library/Preferences/com.apple.LaunchServices.plist.lockfile
+Library/Saved Application State/com.tcltk.wish.savedState/windows.plist
+Library/Saved Application State/com.tcltk.wish.savedState/data.data
