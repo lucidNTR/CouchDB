@@ -10,7 +10,7 @@
 ## License for the specific language governing permissions and limitations under
 ## the License.
 
-couch_davlibdir = $(localerlanglibdir)/couch_dav-exp
+couch_davlibdir = $(localerlanglibdir)/couch_dav_exp
 couch_davebindir = $(couch_davlibdir)/ebin
 
 couch_davebin_DATA = $(compiled_files)
@@ -20,18 +20,21 @@ source_files = \
    	src/couch_dav_fs.erl \
    	src/couch_dav_srv.erl \
    	src/couch_dav_db.erl \
-   	src/couch_dav_doc.erl
+   	src/couch_dav_doc.erl \
+   	src/couch_dav_util.erl 
 
 compiled_files = \
     ebin/couch_dav.beam \
     ebin/couch_dav_fs.beam \
     ebin/couch_dav_srv.beam \
     ebin/couch_dav_db.beam \
-    ebin/couch_dav_doc.beam
+    ebin/couch_dav_doc.beam \
+   	ebin/couch_dav_util.beam
 
 EXTRA_DIST = $(source_files)
 CLEANFILES = $(compiled_files)
 
-ebin/%.beam: src/%.erl
+ebin/%.beam: src/%.erl $(include_files)
 	@mkdir -p ebin/
-	$(ERLC) -I$(top_srcdir)/src/couchdb -o ebin/ $(ERLC_FLAGS) ${TEST} $<;
+	$(ERLC) -Wall -I$(top_srcdir)/src -I$(top_srcdir)/src/couchdb \
+        -o ebin/ $(ERLC_FLAGS) ${TEST} $<;
