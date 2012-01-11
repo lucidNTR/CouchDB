@@ -1,5 +1,5 @@
--module(couch_httpd_dav_fs).
--export([options/0, get/2, mkcol/2, delete/1, copy/2, move/3, put/2, is_directory/1, get_children/4, trans_opt/1 ]).
+-module(couch_dav_fs).
+-export([options/0, get/2, mkcol/2, delete/1, copy/2, move/3, put/2, get_children/4, trans_opt/1 ]).
 -include_lib("kernel/include/file.hrl").
 -include("couch_db.hrl").
 
@@ -12,12 +12,10 @@
 options() ->
     { methods, ?R_METHODS ++ ?W_METHODS, mode, "1,2" }.
 
-
-trans_opt( Dav_Opts ) ->
-    { Tail } = Dav_Opts,
+trans_opt( { Tail } ) ->
     { RelPathBL, [ NameB ] } = lists:split( length(Tail)-1, Tail ), 
     RelPath = lists:concat(lists:flatmap(fun(X)->[binary_to_list(X),"/"] end, RelPathBL) ),
-    Name=binary_to_list(NameB),
+    Name = binary_to_list(NameB),
     {RelPath, Name}.
 
 
@@ -86,10 +84,10 @@ maybe_mkdir(RelPath) ->
             $/ ) ),
     UpPath = ?DAV_PATH ++ "/" ++ RelUp,
     case file:read_file_info( ThisPath ) of
-        { ok, Dir } -> ok;
+        { ok, _Dir } -> ok;
         _ -> 
             case file:read_file_info( UpPath ) of
-                { ok, Dir } -> file:make_dir( ThisPath ), ok;
+                { ok, _Dir } -> file:make_dir( ThisPath ), ok;
                 _ -> 
                     case maybe_mkdir( RelUp ) of
                         ok -> file:make_dir( ThisPath ), ok;
@@ -101,11 +99,11 @@ mkcol({ RelPath, Name }, Req ) ->
     couch_httpd:send_json( Req, 200, {[{successful, <<"created directory">>}]} ).
 
 
-copy({ RelPath, Name }, Req) ->
+copy({ _RelPath, _Name }, Req) ->
     couch_httpd:send_json( Req, 200, {[{successful, <<"copied">>}]} ).
 
 
-move({ RelPath, Name }, Dest, #httpd{ mochi_req = MochiReq }=Req) ->
+move({ RelPath, Name }, Dest, _Req) ->
     file:rename(?DAV_PATH ++ "/" ++ RelPath ++ Name, ?DAV_PATH ++ Dest).
 
 delete({ RelPath, Name } ) ->
@@ -120,16 +118,13 @@ delete( Path ) ->
                         ok ->
                             file:del_dir(Path);
                         Err ->
-                            Err
-                    end;
+                            Err end;
                 Err ->
-                    Err
-            end;
+                    Err end;
         {ok, _} ->
             file:delete(Path);
         Err ->
-            Err
-    end.
+            Err end.
 delete(_Dir, []) ->
     ok;
 delete(Dir, [H|T]) ->
@@ -138,54 +133,49 @@ delete(Dir, [H|T]) ->
         ok ->
             delete(Dir, T);
         Err ->
-            Err
-    end.
-
-
-is_directory( { RelPath, Name } ) ->
-    Path = RelPath ++ Name,
-    case file:read_file_info( ?DAV_PATH ++ "/" ++ Path ) of
-    { ok, Dir } -> 
-        case Dir#file_info.type of
-            directory -> true;
-            regular -> false end;
-    _Else -> no_exist end.
+            Err end.
 
         
-get_children( { RelPath, Name }, N, Url, _ ) ->   
-    case file:read_file_info( ?DAV_PATH ++ "/" ++ RelPath ++ Name ) of
-        { ok, _Info } -> 
-            Base = [{ RelPath, Name, Url }],
-            Total = if 
-                N>0 -> 
-                    { ok, L } = file:list_dir( ?DAV_PATH ++ "/" ++ RelPath ++ Name ),
-                    Base ++ [{ RelPath ++ Name ++ "/", TempName, Url ++ "/" ++ TempName } || TempName <- L  ];
-                true -> Base end,
-            lists:map( 
-                fun( {RelPath, Name, TempUrl} ) -> make_dav_entry( { RelPath, Name }, TempUrl ) end, Total );
-        _Else -> [] end.
-make_dav_entry({ RelPath, Name }, Url) ->
-    case file:read_file_info(?DAV_PATH ++ "/" ++ RelPath ++ Name) of
-        { ok, F } ->
-            {response, [], [
-                {href, [], [ Url ]},
-                {propstat, [], [
-                    {prop, [], [
-                        {name, [], [Name]},
-                        {displayname, [], [Name]},
-                        {creationdate, [], [httpd_util:rfc1123_date(F#file_info.ctime)]}, 
-                        {getlastmodified, [], [httpd_util:rfc1123_date(F#file_info.mtime)]},
-                        {getcontentlength, [], [integer_to_list(F#file_info.size)]},
-                        {getetag, [], [
-                            binary_to_list( 
-                                couch_httpd:make_etag(
-                                    integer_to_list(F#file_info.size) ++ httpd_util:rfc1123_date(F#file_info.mtime) ) )]},
-                        {resourcetype, [], if F#file_info.type == directory -> [{collection, [], []}]; true ->[] end },
-                        %{ishidden, [], [ F#file_info.is_hidden ]}
-                        {supportedlock, [], []},
-                        {lockdiscovery, [], []} ]},
-                    {status, [], ["HTTP/1.1 200 OK"] } ]} ]};
-        _Error -> 
-            {response, [], [
-                {propstat, [], [ 
-                    {status, [ RelPath ++ Name ], ["HTTP/1.1 500 Error"] } ]} ]} end.
+get_children( { RelPath, Name }, Url, Depth, _  ) ->       
+    Path = ?DAV_PATH ++ "/" ++ RelPath ++ Name,
+    NormPath = couch_util:normpath(Path),
+    case file:read_file_info( NormPath ) of
+        { ok, FInfo } -> 
+            Base = [ make_dav_entry( Name, FInfo, Url ) ],           
+            case FInfo#file_info.type of
+                directory -> 
+                    case Depth of 
+                        0 -> 
+                            Base;
+                        N when N < 5 -> 
+                            { ok, Children } = file:list_dir( NormPath ),            
+                            lists:foldl( 
+                                fun(TempName, Sum) -> 
+                                    get_children({ RelPath ++ Name, TempName }, Url ++ "/" ++ TempName, Depth-1, []) ++ Sum end, 
+                                Base, 
+                                Children);
+                        _ -> 
+                            wrong_depth end;
+                regular -> 
+                    Base end;
+        _ -> [] end.
+
+make_dav_entry( Name, FInfo, Url) ->
+    {response, [], [
+        {href, [], [ Url ]},
+        {propstat, [], [
+            {prop, [], [
+                {name, [], [Name]},
+                {displayname, [], [Name]},
+                {creationdate, [], [httpd_util:rfc1123_date(FInfo#file_info.ctime)]}, 
+                {getlastmodified, [], [httpd_util:rfc1123_date(FInfo#file_info.mtime)]},
+                {getcontentlength, [], [integer_to_list(FInfo#file_info.size)]},
+                {getetag, [], [
+                    binary_to_list( 
+                        couch_httpd:make_etag(
+                            integer_to_list(FInfo#file_info.size) ++ httpd_util:rfc1123_date(FInfo#file_info.mtime) ) )]},
+                {resourcetype, [], if FInfo#file_info.type == directory -> [{collection, [], []}]; true ->[] end },
+                %{ishidden, [], [ F#file_info.is_hidden ]} % + include hidden files config section...
+                {supportedlock, [], []},
+                {lockdiscovery, [], []} ]},
+            {status, [], ["HTTP/1.1 200 OK"] } ]} ]}.
