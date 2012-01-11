@@ -33,7 +33,7 @@ keyvalue_buffer_size = 2097152 ; value in bytes
 dav_dir = %localdatadir%/dav_fs ; Directory to store files you dont wan't in your dbs
 dav_files_on_fs = .VolumeIcon.icns, .git, .gitignore, .Trashes, Icon%0D, .DS_Store, Icons.ico, Desktop.ini; File and Folder names you want to store on the filesystem instead of DB
 dav_file_name_parts_on_fs = ._ ; Files with these character sequences in their name will also be stored on filesystem
-dav_no_decode = %0D, %0C ; These character encodings will not be decoded, sometimes necessary to keep things from breaking with certain OSes 
+dav_no_decode = 0D, 0C ; These character encodings will not be decoded, sometimes necessary to keep things from breaking with certain OSes 
 dav_mount_name = CouchDAV ; Name of Mount point that you want the CouchDB webdav-drive to have
 
 [httpd]
