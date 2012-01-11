@@ -16,6 +16,6 @@
     {modules, [
         couch_dav
     ]},
-    {registered, [couch_dav_server]},
+    {registered, [couch_dav]},
     {applications, [kernel, stdlib]}
 ]}.
